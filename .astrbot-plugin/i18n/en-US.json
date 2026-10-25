@@ -1,0 +1,14 @@
+{
+  "views": {
+    "draw-settings": {
+      "title": "Draw Settings",
+      "description": "Configure image backends and models, run test generations, browse draw records and the gallery."
+    }
+  },
+  "pages": {
+    "draw-settings": {
+      "title": "Draw Settings",
+      "description": "Configure image backends and models, run test generations, browse draw records and the gallery."
+    }
+  }
+}

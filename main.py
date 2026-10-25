@@ -1,0 +1,802 @@
+import asyncio
+import contextlib
+import os
+import re
+import time
+import uuid
+from datetime import datetime
+
+from astrbot.api import AstrBotConfig, logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import Image
+from astrbot.api.star import Context, Star, StarTools
+
+from .audit import AuditLog, format_record
+from .backends import BACKEND_ORDER, BACKENDS, backend_missing, backend_summary, create_backend, resolve_key
+from .backends.base import Backend, Clients, DrawRequest, DrawResult, HttpPool, as_bool, as_float, as_int, as_str
+from .backends.novelai import (
+    NovelAIBackend,
+    NovelAIClient,
+    anlas_total,
+    format_expiry,
+    is_opus_free,
+    is_v5_model,
+    mask_token,
+    mask_url_credentials,
+    tier_name,
+)
+from .gallery import Gallery
+from .imaging import to_jpeg
+from .limiter import Limiter
+from .prompting import (
+    FALLBACK_LINES,
+    build_natural_system_prompt,
+    build_persona_system_prompt,
+    build_persona_user_prompt,
+    build_tag_retry_prompt,
+    build_tag_system_prompt,
+    build_tag_user_prompt,
+    choose_tag_result,
+    clean_line,
+    contains_non_english,
+    drop_non_english_tags,
+    join_tags,
+    normalize_orientation,
+    parse_natural_output,
+    parse_tag_output,
+    strip_think,
+)
+from .webapi import WebApi
+
+PLUGIN_NAME = "astrbot_plugin_multi_draw"
+LOG_PREFIX = "[multi_draw]"
+
+PERSONA_LLM_TIMEOUT = 30
+VISION_LLM_TIMEOUT = 60
+PROMPT_LLM_TIMEOUT = 60
+MAX_DESCRIPTION_CHARS = 1000
+ANLAS_SETTLE_SECONDS = 1.5
+# 看图评价时发给 LLM 的图片长边上限：足够看清画面，又不会让请求过大
+EVAL_IMAGE_MAX_EDGE = 1024
+# 这些平台在流水线结束后会关闭回复通道，后台任务发出的消息会被丢弃，需要等绘图完成
+INLINE_PLATFORMS = ("webchat", "wecom_ai_bot")
+# 等不到绘图完成时给事件打上的标记（值为当时的 monotonic 时间）：之后的消息改为通过 context.send_message 主动发送
+DETACHED_KEY = "multi_draw_detached"
+# 提前结束本轮后，至少等这么久再主动发送：WebUI 对话关闭本轮的回复通道需要一点时间，太早发送的消息会丢失
+DETACH_SETTLE_SECONDS = 3.0
+
+
+def _err_text(e: BaseException) -> str:
+    return str(e).strip() or type(e).__name__
+
+
+def _quiet(task: asyncio.Task) -> asyncio.Task:
+    """取走任务的异常，避免任务未被 await 时出现 "Task exception was never retrieved"。
+
+    await 该任务时异常仍会正常抛出。
+    """
+    task.add_done_callback(lambda t: t.cancelled() or t.exception())
+    return task
+
+
+def _persona_text(persona) -> str:
+    if not persona:
+        return ""
+    if isinstance(persona, dict):
+        text = persona.get("prompt") or persona.get("system_prompt") or ""
+    else:
+        text = getattr(persona, "system_prompt", None) or getattr(persona, "prompt", None) or ""
+    return str(text).strip()
+
+
+class MultiDrawPlugin(Star):
+    """多平台绘图：直接让 Bot 画画；管理员可用 /draw use、/draw account、/draw audit [页码]"""
+
+    def __init__(self, context: Context, config: AstrBotConfig):
+        super().__init__(context)
+        self.config = config
+        self.http = HttpPool()
+        self.nai = NovelAIClient()
+        self.clients = Clients(http=self.http, novelai=self.nai)
+        data_dir = StarTools.get_data_dir(PLUGIN_NAME)
+        self.audit = AuditLog(data_dir / "audit.jsonl")
+        self.gallery = Gallery(data_dir / "images")
+        self.eval_dir = data_dir / "eval"
+        self.config_lock = asyncio.Lock()
+        self._limiters: dict[str, Limiter] = {}
+        self._inflight: set[str] = set()
+        self._tasks: set[asyncio.Task] = set()
+        self._closing = False
+        self.web = WebApi(self, PLUGIN_NAME)
+        self.web.register(context)
+
+    async def terminate(self):
+        self._closing = True
+        self.web.unregister(self.context)
+        tasks = list(self._tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        await self.http.close()
+        await self.nai.close()
+
+    # ------------------------------------------------------------------ 配置
+
+    def section(self, name: str) -> dict:
+        value = self.config.get(name)
+        return value if isinstance(value, dict) else {}
+
+    def backend_key(self) -> str:
+        key = as_str(self.section("draw").get("backend")) or "novelai"
+        if key not in BACKENDS:
+            logger.warning(f"{LOG_PREFIX} 未知的绘图平台 {key}，改用 NovelAI")
+            key = "novelai"
+        return key
+
+    def backend(self, key: str | None = None) -> Backend:
+        key = key or self.backend_key()
+        return create_backend(key, self.section(key))
+
+    async def save_config(self) -> None:
+        """保存插件配置（不会触发插件重载）。调用方需持有 config_lock。"""
+        saver = getattr(self.config, "save_config_async", None)  # AstrBot >= 4.27
+        if callable(saver):
+            await saver()
+        else:
+            self.config.save_config()
+
+    def _is_admin(self, event: AstrMessageEvent) -> bool:
+        raw = self.config.get("admin_ids") or []
+        if isinstance(raw, (str, int)):
+            raw = re.split(r"[,，\s]+", str(raw))
+        admins = {str(x).strip() for x in raw if str(x).strip()}
+        return str(event.get_sender_id()).strip() in admins
+
+    # ------------------------------------------------------------------ LLM 工具与指令
+
+    @filter.llm_tool(name="draw_image")
+    async def draw_image_tool(self, event: AstrMessageEvent, description: str = "", orientation: str = "",
+                              **kwargs):
+        """画一张图并直接发送给用户。当用户请你画画、画图、生成图片/插画/头像/壁纸时调用；只是普通聊天时不要调用。插件会自动用你的口吻发送开工提示、图片和评价，所以调用此工具时不要再输出任何回复文字。
+
+        Args:
+            description(string): 要画的内容，用自然语言完整描述：角色、外貌、服装、动作、场景、氛围、画风等用户的全部要求，可结合上下文补全
+            orientation(string): 可选的画面方向：portrait（竖图）、landscape（横图）或 square（方图），不确定就留空
+        """
+        # 绘图耗时可能超过 AstrBot 的工具调用超时，因此放到后台任务中进行。
+        # 返回 None 会结束本轮 Agent 循环，主 LLM 不会再额外回复一条消息。
+        task = self._spawn(self._draw_flow(event, str(description or ""), str(orientation or ""), "llm"))
+        if task is not None and event.get_platform_name() in INLINE_PLATFORMS:
+            # 在工具调用超时之前尽量等绘图完成；等不及时先结束本轮，之后的消息改为主动发送。
+            # asyncio.wait 被取消或超时都不会连带取消绘图任务。
+            try:
+                done, _ = await asyncio.wait({task}, timeout=self._inline_wait_seconds(event))
+            except asyncio.CancelledError:
+                event.set_extra(DETACHED_KEY, time.monotonic())
+                raise
+            if not done:
+                event.set_extra(DETACHED_KEY, time.monotonic())
+        return None
+
+    def _inline_wait_seconds(self, event: AstrMessageEvent) -> float:
+        """AstrBot 的工具调用超时减去余量。4.28 起在 agent_runner 设置中，之前在 provider_settings 中。"""
+        try:
+            cfg = self.context.get_config(umo=event.unified_msg_origin) or {}
+        except Exception:
+            cfg = {}
+        timeout = 0.0
+        for path in (("agent_runner", "config", "misc", "tool_call_timeout"), ("provider_settings", "tool_call_timeout")):
+            value = cfg
+            for part in path:
+                value = value.get(part) if isinstance(value, dict) else None
+            if value is not None:
+                timeout = as_float(value, 0.0)
+                break
+        return max(5.0, (timeout or 60.0) - 10.0)
+
+    @filter.command_group("draw")
+    def draw(self):
+        """多平台绘图"""
+
+    @draw.command("status")
+    async def draw_status(self, event: AstrMessageEvent):
+        """查看当前绘图平台和各平台的配置情况"""
+        current = self.backend_key()
+        lines = [f"当前绘图平台：{BACKENDS[current].label}（{backend_summary(self.backend())}）", "各平台："]
+        for key in BACKEND_ORDER:
+            missing = backend_missing(self.backend(key))
+            mark = "▶" if key == current else ("✅" if not missing else "⚪")
+            lines.append(f"{mark} {key}：{BACKENDS[key].label}" + (f"（{missing}）" if missing else ""))
+        lines.append("管理员可用 /draw use <平台> 切换，例如 /draw use openai")
+        yield event.plain_result("\n".join(lines)).use_t2i(False)
+
+    @draw.command("use")
+    async def draw_use(self, event: AstrMessageEvent, name: str = ""):
+        """切换绘图平台（管理员）：/draw use <平台>"""
+        if not self._is_admin(event):
+            yield event.plain_result("权限不足：仅插件配置中的管理员可以使用该指令。")
+            return
+        key = resolve_key(name)
+        if not key:
+            names = "、".join(BACKEND_ORDER)
+            yield event.plain_result(f"请指定平台：{names}，例如 /draw use openai")
+            return
+        missing = backend_missing(self.backend(key))
+        try:
+            async with self.config_lock:
+                draw = self.config.get("draw")
+                if not isinstance(draw, dict):
+                    draw = {}
+                    self.config["draw"] = draw
+                draw["backend"] = key
+                await self.save_config()
+        except Exception as e:
+            logger.warning(f"{LOG_PREFIX} 保存配置失败：{_err_text(e)}")
+            yield event.plain_result(f"已切换，但保存配置失败（重启后会恢复原设置）：{_err_text(e)}")
+            return
+        text = f"已切换到 {BACKENDS[key].label}（{backend_summary(self.backend(key))}）。"
+        if missing:
+            text += f"\n注意：{missing}，在补全配置之前无法画画。"
+        yield event.plain_result(text).use_t2i(False)
+
+    @draw.command("account")
+    async def draw_account(self, event: AstrMessageEvent):
+        """查询 NovelAI 账户与 Anlas 余额（管理员）"""
+        if not self._is_admin(event):
+            yield event.plain_result("权限不足：仅插件配置中的管理员可以使用该指令。")
+            return
+        backend = self.backend("novelai")
+        if backend.missing():
+            yield event.plain_result("尚未配置 NovelAI Token。")
+            return
+        try:
+            data = await backend.subscription(self.clients)
+        except Exception as e:
+            logger.warning(f"{LOG_PREFIX} 查询订阅失败：{_err_text(e)}")
+            yield event.plain_result(f"查询失败：{_err_text(e)}")
+            return
+        yield event.plain_result(self._format_account(data, backend)).use_t2i(False)
+
+    @draw.command("audit")
+    async def draw_audit(self, event: AstrMessageEvent, page: int = 1):
+        """查看绘图记录（管理员）：/draw audit [页码]"""
+        if not self._is_admin(event):
+            yield event.plain_result("权限不足：仅插件配置中的管理员可以使用该指令。")
+            return
+        page_size = as_int(self.section("audit").get("page_size"), 10, 1, 50)
+        records, page, pages, total = await self.audit.page(as_int(page, 1, 1), page_size)
+        if not total:
+            yield event.plain_result("暂无绘图记录。")
+            return
+        lines = [f"绘图记录（第 {page}/{pages} 页，共 {total} 条，从新到旧）"]
+        lines += [format_record(r) for r in records]
+        if page < pages:
+            lines.append(f"查看下一页：/draw audit {page + 1}")
+        yield event.plain_result("\n".join(lines)).use_t2i(False)
+
+    # ------------------------------------------------------------------ 绘图流程
+
+    def _spawn(self, coro) -> asyncio.Task | None:
+        if self._closing:
+            coro.close()
+            return None
+        task = asyncio.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._on_task_done)
+        return task
+
+    def _on_task_done(self, task: asyncio.Task) -> None:
+        self._tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            logger.error(f"{LOG_PREFIX} 绘图任务异常：{task.exception()!r}")
+
+    def slot_limit(self, key: str) -> int:
+        fixed = getattr(BACKENDS.get(key), "max_concurrency", None)
+        return fixed or as_int(self.section("draw").get("max_concurrency"), 2, 1, 8)
+
+    def _limiter(self, key: str) -> Limiter:
+        limiter = self._limiters.get(key)
+        if limiter is None:
+            limiter = self._limiters[key] = Limiter(lambda: self.slot_limit(key))
+        return limiter
+
+    def wake_queues(self) -> None:
+        """修改并发数后调用：按新的上限立即放行排队的请求。"""
+        for limiter in self._limiters.values():
+            limiter.dispatch()
+
+    @contextlib.asynccontextmanager
+    async def slot(self, backend: Backend):
+        """按平台限制同时进行的请求数，超出的请求按先后顺序排队。"""
+        limiter = self._limiter(backend.key)
+        await limiter.acquire()
+        try:
+            yield
+        finally:
+            limiter.release()
+
+    def _queued_ahead(self, backend: Backend) -> int:
+        return self._limiter(backend.key).queued_ahead()
+
+    async def _draw_flow(self, event: AstrMessageEvent, description: str, orientation: str, source: str):
+        description = description.strip()[:MAX_DESCRIPTION_CHARS]
+        if not description:
+            await self._send_text(event, "想让我画什么呢？把想画的内容告诉我吧～")
+            return
+        backend = self.backend()
+        missing = backend_missing(backend)
+        if missing:
+            await self._send_text(event, f"{missing}，暂时没法画画哦。")
+            return
+        uid = str(event.get_sender_id())
+        if uid in self._inflight:
+            await self._send_text(event, "你的上一张画还没完成，请稍等一下～")
+            return
+        self._inflight.add(uid)
+        try:
+            await self._draw(event, description, orientation, source, backend)
+        finally:
+            self._inflight.discard(uid)
+
+    async def _draw(self, event: AstrMessageEvent, description: str, orientation: str, source: str,
+                    backend: Backend):
+        started = time.monotonic()
+        record = {
+            "time": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "source": source,
+            "user_id": str(event.get_sender_id()),
+            "user_name": as_str(event.get_sender_name()),
+            "group_id": as_str(event.get_group_id()),
+            "umo": event.unified_msg_origin,
+            "backend": backend.key,
+            "backend_label": backend.label,
+            "request": description,
+            "status": "failed",
+        }
+        with contextlib.suppress(Exception):
+            record["model"] = backend.model  # 生成前就失败（如 LLM 不可用）时记录中也有模型
+        stage = "prompt"
+        persona = ""
+        prompt_task = None
+        req = None
+        result = None
+        try:
+            persona = await self._persona_prompt(event)
+            prompt_task = _quiet(asyncio.create_task(
+                self._make_prompt(event, description, orientation, backend.prompt_mode)
+            ))
+            start_line = await self._persona_line(event, persona, "start", description=description)
+            queued = self._queued_ahead(backend)
+            if queued:
+                start_line += f"\n（前面还有 {queued} 张在排队）"
+            await self._send_text(event, start_line)
+
+            generated = await prompt_task
+            req = self._build_request(backend, generated, orientation)
+            logger.info(f"{LOG_PREFIX} 发送给 {backend.label} 的 prompt：{req.prompt}")
+            if req.negative:
+                logger.info(f"{LOG_PREFIX} 发送给 {backend.label} 的负面 prompt：{req.negative}")
+            record.update(prompt=req.prompt, negative=req.negative, orientation=req.orientation)
+
+            stage = "generate"
+            send_task, result = await self._generate(backend, req, record, event)
+
+            stage = "send"
+            await send_task
+            record["status"] = "success"
+        except asyncio.CancelledError:
+            record.update(stage=stage, error="任务被取消（插件被停用或重载）")
+            if stage != "send":
+                # terminate() 只取消一次，这里还能发出一条简短提示；限时避免拖慢重载
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await asyncio.wait_for(
+                        self._send_text(event, "绘图被中断了（插件正在重载或关闭），请稍后再试～"), 5
+                    )
+            raise
+        except Exception as e:
+            error = _err_text(e)
+            record.update(stage=stage, error=error[:500])
+            logger.warning(f"{LOG_PREFIX} 绘图失败（{backend.label}，{stage}）：{error}")
+            await self._send_text(event, f"绘图失败：{error}")
+            line = await self._persona_line(event, persona, "fail", description=description, error=error)
+            await self._send_text(event, line)
+        else:
+            comment = await self._persona_line(
+                event, persona, "success", image=result, description=description, prompt=req.prompt
+            )
+            await self._send_text(event, comment)
+        finally:
+            if prompt_task is not None and not prompt_task.done():
+                prompt_task.cancel()
+            record["duration"] = round(time.monotonic() - started, 1)
+            await self._save_record(record)
+
+    def _build_request(self, backend: Backend, generated: dict, orientation: str) -> DrawRequest:
+        orient = (
+            normalize_orientation(orientation)
+            or generated["orientation"]
+            or normalize_orientation(self.section("draw").get("default_orientation"))
+            or "portrait"
+        )
+        positive = as_str(backend.section.get("required_positive"))
+        negative = as_str(backend.section.get("required_negative"))
+        if backend.prompt_mode == "tags":
+            # LLM 生成的标签已在 _make_prompt 中过滤，这里只过滤配置里填写的必定包含的提示词
+            positive, dropped = drop_non_english_tags(positive)
+            negative, dropped_negative = drop_non_english_tags(negative)
+            if dropped or dropped_negative:
+                logger.warning(f"{LOG_PREFIX} 配置的提示词中含非英文标签，已忽略：{dropped + dropped_negative}")
+        if isinstance(backend, NovelAIBackend) and is_v5_model(backend.model) and backend.free_guard:
+            logger.warning(f"{LOG_PREFIX} {backend.model} 是 V5 模型，不受免费参数保护：会消耗 Opus 用量条，用尽后扣 Anlas")
+        return DrawRequest(
+            # 质量词按官方做法追加在末尾，必须的负面词放在最前
+            prompt=join_tags(generated["prompt"], positive),
+            negative=join_tags(negative, generated["negative"]),
+            orientation=orient,
+        )
+
+    async def _generate(self, backend: Backend, req: DrawRequest, record: dict,
+                        event: AstrMessageEvent) -> tuple[asyncio.Task, DrawResult]:
+        """按平台排队生成图片，返回 (发送图片的任务, 生成结果)。
+
+        使用 NovelAI 且开启 Anlas 记录时，在占用生成名额期间查询前后余额，差值只属于本次请求。
+        """
+        track = isinstance(backend, NovelAIBackend) and as_bool(self.section("audit").get("track_anlas"), True)
+        # 先记下预计使用的参数，生成失败时记录中也有模型和尺寸
+        with contextlib.suppress(Exception):
+            record.update(backend.plan(req))
+        async with self.slot(backend):
+            before = await self._anlas(backend) if track else None
+            try:
+                result = await backend.generate(self.clients, req)
+            except Exception:
+                if before is not None:  # 失败的请求也可能已经扣费
+                    await self._record_anlas(backend, record, before)
+                raise
+            record.update(result.params)
+            if result.text:
+                logger.info(f"{LOG_PREFIX} {backend.label} 返回的文字：{result.text[:500]}")
+            # 先把图片发出去，等待扣费结算、保存图片与上传同时进行
+            image = await self._image_for_sending(result)
+            send_task = _quiet(asyncio.create_task(self._deliver(event, event.chain_result([Image.fromBytes(image)]))))
+            try:
+                if before is not None:
+                    await self._record_anlas(backend, record, before)
+                await self._save_image(backend, result, record)
+            except asyncio.CancelledError:
+                send_task.cancel()
+                raise
+            return send_task, result
+
+    async def _image_for_sending(self, result: DrawResult) -> bytes:
+        """超过设置大小的图片转成 JPEG 再发送：QQ 等平台以 base64 内联发送图片，过大时可能发送失败。"""
+        limit_mb = as_int(self.section("draw").get("compress_over_mb"), 8, 0)
+        if not limit_mb or len(result.image) <= limit_mb * 1024 * 1024:
+            return result.image
+        compressed = await asyncio.to_thread(to_jpeg, result.image, 0, 90)
+        if compressed and len(compressed) < len(result.image):
+            logger.info(f"{LOG_PREFIX} 图片 {len(result.image) // 1024} KB 超过 {limit_mb} MB，"
+                        f"已压缩为 JPEG {len(compressed) // 1024} KB 后发送")
+            return compressed
+        return result.image
+
+    async def _save_image(self, backend: Backend, result: DrawResult, record: dict) -> None:
+        draw = self.section("draw")
+        if not as_bool(draw.get("save_images"), True):
+            return
+        try:
+            path = await self.gallery.save(
+                result.image, result.mime, backend.key, as_int(draw.get("keep_images"), 200, 0)
+            )
+            record["image"] = f"{path.parent.name}/{path.name}"
+        except Exception as e:
+            logger.warning(f"{LOG_PREFIX} 保存图片失败：{_err_text(e)}")
+
+    async def _record_anlas(self, backend: NovelAIBackend, record: dict, before: int) -> None:
+        await asyncio.sleep(ANLAS_SETTLE_SECONDS)
+        after = await self._anlas(backend)
+        record.update(anlas_before=before, anlas_after=after)
+        if after is not None:
+            record["anlas_cost"] = before - after
+
+    async def _anlas(self, backend: NovelAIBackend) -> int | None:
+        try:
+            data = await backend.subscription(self.clients)
+        except Exception as e:
+            logger.debug(f"{LOG_PREFIX} 查询 Anlas 失败：{_err_text(e)}")
+            return None
+        return anlas_total(data)
+
+    async def _save_record(self, record: dict) -> None:
+        self.audit.max_records = as_int(self.section("audit").get("max_records"), 2000, 10)
+        try:
+            await self.audit.append(record)
+        except Exception as e:
+            logger.warning(f"{LOG_PREFIX} 写入绘图记录失败：{_err_text(e)}")
+
+    async def _deliver(self, event: AstrMessageEvent, chain) -> None:
+        """发送消息；本轮对话已提前结束（见 draw_image_tool）时改为主动发送。"""
+        detached_at = event.get_extra(DETACHED_KEY)
+        if not detached_at:
+            await event.send(chain)
+            return
+        if isinstance(detached_at, (int, float)):
+            wait = DETACH_SETTLE_SECONDS - (time.monotonic() - detached_at)
+            if wait > 0:
+                await asyncio.sleep(wait)
+        await self.context.send_message(event.unified_msg_origin, chain)
+
+    async def _send_text(self, event: AstrMessageEvent, text: str) -> None:
+        text = (text or "").strip()
+        if not text:
+            return
+        try:
+            await self._deliver(event, event.plain_result(text))
+        except Exception as e:
+            logger.warning(f"{LOG_PREFIX} 发送消息失败：{_err_text(e)}")
+
+    # ------------------------------------------------------------------ LLM
+
+    async def _llm(self, event: AstrMessageEvent, provider_id: str, system_prompt: str, prompt: str,
+                   timeout: float, image_urls: list[str] | None = None) -> str:
+        """调用 LLM；配置的提供商不可用时回退到当前会话的提供商。"""
+        candidates = [provider_id] if provider_id else []
+        try:
+            session_pid = await self.context.get_current_chat_provider_id(event.unified_msg_origin)
+        except Exception as e:
+            logger.debug(f"{LOG_PREFIX} 获取当前会话模型失败：{_err_text(e)}")
+            session_pid = ""
+        if session_pid and session_pid not in candidates:
+            candidates.append(session_pid)
+        if image_urls:
+            # 跳过明确声明不支持图片输入的模型（AstrBot 的 llm_generate 不会替我们过滤）
+            candidates = [pid for pid in candidates if self._supports_image(pid) is not False]
+            if not candidates:
+                raise RuntimeError("可用的模型都不支持图片输入")
+        if not candidates:
+            raise RuntimeError("没有可用的 LLM 提供商")
+        kwargs = {"image_urls": image_urls} if image_urls else {}
+        last_error: Exception | None = None
+        for pid in candidates:
+            try:
+                resp = await asyncio.wait_for(
+                    self.context.llm_generate(
+                        chat_provider_id=pid, prompt=prompt, system_prompt=system_prompt, **kwargs
+                    ),
+                    timeout,
+                )
+                if getattr(resp, "role", "") == "err":
+                    raise RuntimeError(resp.completion_text or "LLM 返回错误")
+                text = strip_think(resp.completion_text or "")
+                if text:
+                    return text
+                raise RuntimeError("LLM 返回了空内容")
+            except Exception as e:
+                last_error = e
+                logger.warning(f"{LOG_PREFIX} LLM({pid}) 调用失败：{_err_text(e)}")
+        raise RuntimeError(f"LLM 调用失败：{_err_text(last_error)}")
+
+    def _supports_image(self, provider_id: str) -> bool | None:
+        """按提供商配置的模态判断是否支持图片输入；未配置时返回 None（不确定，直接尝试）。"""
+        try:
+            provider = self.context.get_provider_by_id(provider_id)
+        except Exception:
+            return None
+        modalities = (getattr(provider, "provider_config", None) or {}).get("modalities")
+        if isinstance(modalities, list) and modalities:
+            return "image" in modalities
+        return None
+
+    async def _make_prompt(self, event: AstrMessageEvent, description: str, orientation: str, mode: str) -> dict:
+        """用 LLM 把绘图需求转换成提示词：tags 模式生成英文标签，natural 模式生成自然语言描述。"""
+        pc = self.section("prompt")
+        sfw = as_bool(pc.get("sfw_only"), True)
+        extra = as_str(pc.get("extra_instruction"))
+        provider_id = as_str(pc.get("provider_id"))
+        orientation = normalize_orientation(orientation)
+        user_prompt = build_tag_user_prompt(description, orientation)
+        if mode != "tags":
+            system_prompt = build_natural_system_prompt(as_str(pc.get("natural_system_prompt")), sfw=sfw, extra=extra)
+            raw = await self._llm(event, provider_id, system_prompt, user_prompt, PROMPT_LLM_TIMEOUT)
+            result = parse_natural_output(raw)
+            if not result["prompt"]:
+                raise RuntimeError("LLM 没有生成有效的绘图提示词")
+            return result
+
+        system_prompt = build_tag_system_prompt(as_str(pc.get("tag_system_prompt")), sfw=sfw, extra=extra)
+        raw = await self._llm(event, provider_id, system_prompt, user_prompt, PROMPT_LLM_TIMEOUT)
+        tags = parse_tag_output(raw)
+        # 标签模式的绘图模型只理解英文：结果里混有中日韩文字时让 LLM 重写一次
+        if contains_non_english(tags["prompt"]) or contains_non_english(tags["negative"]):
+            logger.info(f"{LOG_PREFIX} 提示词含非英文内容，要求 LLM 改写为英文：{tags['prompt'][:200]}")
+            try:
+                raw = await self._llm(
+                    event,
+                    provider_id,
+                    system_prompt,
+                    build_tag_retry_prompt(description, orientation, raw),
+                    PROMPT_LLM_TIMEOUT,
+                )
+                chosen = choose_tag_result(tags, parse_tag_output(raw))
+                if chosen is tags:
+                    logger.warning(f"{LOG_PREFIX} 改写结果不如第一次，沿用第一次的结果并去掉非英文标签")
+                tags = chosen
+            except Exception as e:
+                logger.warning(f"{LOG_PREFIX} 改写英文提示词失败，将去掉非英文标签：{_err_text(e)}")
+        tags["prompt"], dropped = drop_non_english_tags(tags["prompt"])
+        tags["negative"], dropped_negative = drop_non_english_tags(tags["negative"])
+        if dropped or dropped_negative:
+            logger.warning(f"{LOG_PREFIX} 已去掉无法使用的非英文标签：{dropped + dropped_negative}")
+        if not tags["prompt"]:
+            raise RuntimeError("LLM 没有生成有效的英文绘图提示词")
+        return tags
+
+    async def _persona_line(self, event: AstrMessageEvent, persona: str, kind: str,
+                            image: DrawResult | None = None, **info) -> str:
+        """按 Bot 人格生成一句台词；失败时使用内置台词。
+
+        生成评价且开启了「评价时附上生成的图片」时，先带图调用看图模型，失败再改为只发文字。
+        """
+        pc = self.section("persona")
+        max_len = as_int(pc.get("max_length"), 40, 10, 200)
+        system_prompt = build_persona_system_prompt(persona, max_len)
+        template = as_str(pc.get(f"{kind}_prompt"))
+        provider_id = as_str(pc.get("provider_id"))
+        if image is not None and kind == "success" and as_bool(pc.get("comment_with_image"), False):
+            path = None
+            try:
+                path = await asyncio.to_thread(self._write_eval_image, image)
+                text = await self._llm(
+                    event,
+                    as_str(pc.get("vision_provider_id")) or provider_id,
+                    system_prompt,
+                    build_persona_user_prompt(kind, template, with_image=True, **info),
+                    VISION_LLM_TIMEOUT,
+                    image_urls=[path],
+                )
+                text = clean_line(text, max_len)
+                if text:
+                    return text
+            except Exception as e:
+                logger.warning(f"{LOG_PREFIX} 看图评价失败，改为只根据提示词评价：{_err_text(e)}")
+            finally:
+                if path:
+                    with contextlib.suppress(OSError):
+                        os.remove(path)
+        try:
+            text = await self._llm(
+                event,
+                provider_id,
+                system_prompt,
+                build_persona_user_prompt(kind, template, **info),
+                PERSONA_LLM_TIMEOUT,
+            )
+            text = clean_line(text, max_len)
+            if text:
+                return text
+        except Exception as e:
+            logger.warning(f"{LOG_PREFIX} 生成人格台词失败，使用默认台词：{_err_text(e)}")
+        return FALLBACK_LINES[kind]
+
+    def _write_eval_image(self, image: DrawResult) -> str:
+        """把生成的图片缩小并转成 JPEG，写入临时文件，返回绝对路径。
+
+        llm_generate 的 image_urls 在各版本 AstrBot 中都支持普通文件路径，且旧版本会把文件一律标记为
+        image/jpeg，所以统一转成 JPEG；缩小尺寸可以减少看图模型的请求大小和费用。
+        """
+        data = to_jpeg(image.image, EVAL_IMAGE_MAX_EDGE, 85)
+        ext = "jpg"
+        if data is None:  # Pillow 不可用时直接使用原图
+            data, ext = image.image, {"image/png": "png", "image/webp": "webp"}.get(image.mime, "jpg")
+        self.eval_dir.mkdir(parents=True, exist_ok=True)
+        path = (self.eval_dir / f"eval_{uuid.uuid4().hex}.{ext}").resolve()
+        path.write_bytes(data)
+        return str(path)
+
+    async def _persona_prompt(self, event: AstrMessageEvent) -> str:
+        """获取当前会话实际使用的人格设定（system prompt）。"""
+        pm = getattr(self.context, "persona_manager", None)
+        if pm is None:
+            return ""
+        umo = event.unified_msg_origin
+        try:
+            override = as_str(self.section("persona").get("persona_id"))
+            if override == "[%None]":  # 明确选择不使用人格
+                return ""
+            if override:
+                found = next((p for p in pm.personas_v3 if p.get("name") == override), None)
+                if found is None and override == "default":
+                    # 人格选择器中的「默认人格」：已有自定义人格时它不在 personas_v3 中
+                    found = await self._builtin_default_persona(pm)
+                if found:
+                    return _persona_text(found)
+                logger.warning(f"{LOG_PREFIX} 未找到配置的人格 {override}，改用会话人格")
+
+            conv_pid = await self._conversation_persona_id(event)
+            if hasattr(pm, "resolve_selected_persona"):
+                provider_settings = (self.context.get_config(umo=umo) or {}).get("provider_settings") or {}
+                selected, persona, _, _ = await pm.resolve_selected_persona(
+                    umo=umo,
+                    conversation_persona_id=conv_pid,
+                    platform_name=event.get_platform_name(),
+                    provider_settings=provider_settings,
+                )
+            else:
+                selected, persona = conv_pid, None
+                if conv_pid and conv_pid != "[%None]":
+                    persona = next((p for p in pm.personas_v3 if p.get("name") == conv_pid), None)
+            if selected == "[%None]":  # 会话中明确关闭了人格
+                return ""
+            if persona is None:
+                persona = await pm.get_default_persona_v3(umo=umo)
+            return _persona_text(persona)
+        except Exception as e:
+            logger.warning(f"{LOG_PREFIX} 获取人格失败：{_err_text(e)}")
+            return ""
+
+    @staticmethod
+    async def _builtin_default_persona(pm):
+        """AstrBot 内置的默认人格（id 为 default）。"""
+        getter = getattr(pm, "get_persona_v3_by_id", None)
+        if callable(getter):
+            with contextlib.suppress(Exception):
+                found = getter("default")
+                if asyncio.iscoroutine(found):
+                    found = await found
+                if found:
+                    return found
+        try:
+            from astrbot.core.persona_mgr import DEFAULT_PERSONALITY
+        except Exception:
+            return None
+        return DEFAULT_PERSONALITY
+
+    async def _conversation_persona_id(self, event: AstrMessageEvent) -> str | None:
+        try:
+            req = event.get_extra("provider_request")
+            conv = getattr(req, "conversation", None) if req is not None else None
+            if conv is None:
+                cm = self.context.conversation_manager
+                cid = await cm.get_curr_conversation_id(event.unified_msg_origin)
+                conv = await cm.get_conversation(event.unified_msg_origin, cid) if cid else None
+            return getattr(conv, "persona_id", None) if conv is not None else None
+        except Exception as e:
+            logger.debug(f"{LOG_PREFIX} 获取会话人格失败：{_err_text(e)}")
+            return None
+
+    # ------------------------------------------------------------------ 账户
+
+    def _format_account(self, data: dict, backend: NovelAIBackend) -> str:
+        tier = data.get("tier")
+        steps = data.get("trainingStepsLeft") if isinstance(data.get("trainingStepsLeft"), dict) else {}
+        expiry = format_expiry(data.get("expiresAt"))
+        status = "有效" if data.get("active") else "未激活"
+        if expiry:
+            status += f"，到期 {expiry}"
+        total = anlas_total(data)
+        proxy = backend.proxy
+        lines = [
+            "NovelAI 账户信息",
+            f"API 地址：{mask_url_credentials(backend.base_url)}",
+            f"代理：{mask_url_credentials(proxy) if proxy else '未设置（使用 AstrBot 全局代理或直连）'}",
+            f"Token：{mask_token(backend.token)}",
+            f"订阅：{tier_name(tier)}（{status}）",
+            "Anlas：{}（订阅 {} + 购买 {}）".format(
+                total if total is not None else "未知",
+                steps.get("fixedTrainingStepsLeft", "未知"),
+                steps.get("purchasedTrainingSteps", "未知"),
+            ),
+        ]
+        usage = data.get("usage")
+        if isinstance(usage, dict) and usage.get("percent") is not None:
+            lines.append(f"V5 用量条：{usage.get('percent')}%")
+
+        orient = normalize_orientation(self.section("draw").get("default_orientation")) or "portrait"
+        width, height = backend.size(orient)
+        free =tier == 3 and bool(data.get("active")) and is_opus_free(backend.model, width, height, backend.steps)
+        lines.append(
+            f"当前参数：{backend.model} {width}x{height} {backend.steps}步 → "
+            + ("符合 Opus 免费出图条件" if free else "可能消耗 Anlas")
+        )
+        return "\n".join(lines)

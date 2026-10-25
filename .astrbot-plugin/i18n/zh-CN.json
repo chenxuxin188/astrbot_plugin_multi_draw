@@ -1,0 +1,14 @@
+{
+  "views": {
+    "draw-settings": {
+      "title": "绘图设置",
+      "description": "配置绘图平台与模型、试画、查看绘图记录和图库。"
+    }
+  },
+  "pages": {
+    "draw-settings": {
+      "title": "绘图设置",
+      "description": "配置绘图平台与模型、试画、查看绘图记录和图库。"
+    }
+  }
+}

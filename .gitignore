@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.idea/
+.vscode/
+# 以本仓库为工作目录导入 astrbot 时生成的运行时目录
+/data/
