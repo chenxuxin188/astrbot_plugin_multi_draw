@@ -1,11 +1,13 @@
 """ComfyUI 后端的单元测试（模拟 ComfyUI / Comfy Cloud，不访问网络）：python -m pytest tests"""
 
 import asyncio
+import hashlib
 import json
+import re
 import sys
 import uuid
 from pathlib import Path
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, unquote
 
 import httpx
 import pytest
@@ -14,10 +16,11 @@ PLUGIN_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PLUGIN_DIR))
 
 from backends import comfyui  # noqa: E402
-from backends.base import Clients, DrawError, DrawRequest, HttpPool  # noqa: E402
+from backends.base import Clients, DrawError, DrawRequest, HttpPool, InputImage  # noqa: E402
 from backends.comfyui import ComfyUIBackend  # noqa: E402
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+JPG = b"\xff\xd8\xff\xe0" + b"\x01" * 32
 REAL_SLEEP = asyncio.sleep
 CHECKPOINTS = ["illustriousXL_v01.safetensors", "sd_xl_base_1.0.safetensors"]
 OK_ENTRY = {
@@ -37,6 +40,47 @@ def fast(monkeypatch):
     monkeypatch.setattr(asyncio, "sleep", lambda *_a, **_k: REAL_SLEEP(0))
     for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
         monkeypatch.delenv(name, raising=False)
+    comfyui._REQUIRED_CACHE.clear()  # /object_info 的缓存不能影响其他测试
+    yield
+    comfyui._REQUIRED_CACHE.clear()
+
+
+def parse_multipart(request: httpx.Request) -> tuple[dict, dict]:
+    """解析 multipart/form-data 请求体：返回 (普通字段, {字段名: (文件名, Content-Type, 内容)})。"""
+    boundary = request.headers["content-type"].split("boundary=", 1)[1].strip('"').encode()
+    fields, files = {}, {}
+    for chunk in request.content.split(b"--" + boundary)[1:-1]:
+        head, _, data = chunk.removeprefix(b"\r\n").partition(b"\r\n\r\n")
+        data = data.removesuffix(b"\r\n")
+        head = head.decode()
+        name = re.search(r'\bname="([^"]*)"', head).group(1)
+        filename = re.search(r'\bfilename="([^"]*)"', head)
+        if filename:
+            ctype = re.search(r"content-type:\s*(\S+)", head, re.IGNORECASE)
+            files[name] = (filename.group(1), ctype.group(1) if ctype else "", data)
+        else:
+            fields[name] = data.decode()
+    return fields, files
+
+
+def _info(required, optional=()):
+    return {"input": {"required": {k: ["X"] for k in required}, "optional": {k: ["X"] for k in optional}}}
+
+
+# ComfyUI 的 /object_info 中真实节点的必填 / 可选输入（节选）
+OBJECT_INFO = {
+    "ImageScale": _info(["image", "upscale_method", "width", "height", "crop"]),
+    "ImageScaleToTotalPixels": _info(["image", "upscale_method", "megapixels", "resolution_steps"]),
+    "VAEEncode": _info(["pixels", "vae"]),
+    "ReferenceLatent": _info(["conditioning"], ["latent"]),
+    "TextEncodeQwenImageEditPlus": _info(["clip", "prompt"], ["vae", "image1", "image2", "image3"]),
+    "KSampler": _info(["model", "seed", "steps", "cfg", "sampler_name", "scheduler", "positive", "negative",
+                       "latent_image", "denoise"]),
+    "VAEDecode": _info(["samples", "vae"]),
+    "SaveImage": _info(["images", "filename_prefix"]),
+    "GetImageSize": _info(["image"]),
+    "EmptyLatentImage": _info(["width", "height", "batch_size"]),
+}
 
 
 class FakeClock:
@@ -54,7 +98,7 @@ class FakeComfy:
     """模拟本地 ComfyUI：记录请求，提交的任务在 pending 次轮询后完成。"""
 
     def __init__(self, *, pending=1, entry=None, checkpoints=CHECKPOINTS, on_prompt=None, in_queue=False,
-                 cancel_api=True, view=PNG):
+                 cancel_api=True, view=PNG, upload_fail=(), object_info_status=200):
         self.pending = pending
         self.entry = OK_ENTRY if entry is None else entry
         self.checkpoints = checkpoints
@@ -62,10 +106,14 @@ class FakeComfy:
         self.in_queue = in_queue
         self.cancel_api = cancel_api
         self.view = view
+        self.upload_fail = list(upload_fail)  # 上传图片前几次返回的状态码
+        self.object_info_status = object_info_status
         self.requests: list[httpx.Request] = []
         self.bodies: list[dict] = []
+        self.uploads: list[tuple[dict, dict]] = []
         self.accepted: list[str] = []
         self.polls = 0
+        self.object_info_calls = 0
 
     def paths(self, method=None):
         return [r.url.path for r in self.requests if method is None or r.method == method]
@@ -101,6 +149,19 @@ class FakeComfy:
             return httpx.Response(200, json={"cancelled": True})
         if method == "POST" and path in ("/queue", "/interrupt"):
             return httpx.Response(200)
+        if method == "POST" and path == "/upload/image":
+            fields, files = parse_multipart(request)
+            self.uploads.append((fields, files))
+            if self.upload_fail:
+                return httpx.Response(self.upload_fail.pop(0), text="")
+            return httpx.Response(200, json={"name": files["image"][0], "subfolder": fields.get("subfolder", ""),
+                                             "type": fields.get("type", "input")})
+        if method == "GET" and path.startswith("/object_info/"):
+            self.object_info_calls += 1
+            if self.object_info_status != 200:
+                return httpx.Response(self.object_info_status, text="boom")
+            cls = unquote(path.split("/", 2)[2])
+            return httpx.Response(200, json={cls: OBJECT_INFO[cls]} if cls in OBJECT_INFO else {})
         return httpx.Response(404, json={"error": "Not Found"})
 
 
@@ -111,6 +172,8 @@ def run(section, handler, req=None, *, action="generate"):
             backend = ComfyUIBackend(section)
             if action == "models":
                 return await backend.list_models(Clients(http=pool))
+            if action == "balance":
+                return await backend.balance(Clients(http=pool))
             return await backend.generate(Clients(http=pool), req or DrawRequest("1girl, smile", "lowres", seed=42))
         finally:
             await pool.close()
@@ -720,8 +783,10 @@ class FakeCloud:
         self.job = job or {"outputs": {"9": {"images": [{"filename": "out.png", "subfolder": "", "type": "output"}]}}}
         self.prompt_status = prompt_status
         self.prompt_body = prompt_body
+        self.upload_status = 200
         self.requests: list[httpx.Request] = []
         self.bodies: list[dict] = []
+        self.uploads: list[tuple[dict, dict]] = []
 
     def paths(self, method=None):
         return [r.url.path for r in self.requests if method is None or r.method == method]
@@ -748,6 +813,14 @@ class FakeCloud:
                                              {"name": "flux.safetensors", "pathIndex": 0}])
         if method == "POST" and path in ("/api/queue", "/api/interrupt"):
             return httpx.Response(200, json={})
+        if method == "POST" and path == "/api/upload/image":
+            self.uploads.append(parse_multipart(request))
+            if self.upload_status != 200:
+                return httpx.Response(self.upload_status, json={"message": "User has not paid"})
+            # Cloud 按内容哈希存储，返回的 name 与上传的文件名无关
+            return httpx.Response(200, json={"name": "0f1e2d3c4b5a.jpg", "subfolder": "", "type": "input"})
+        if method == "GET" and path == "/api/object_info":
+            return httpx.Response(200, json=OBJECT_INFO)
         return httpx.Response(404, json={"code": "not_found", "message": "Not found"})
 
 
@@ -760,7 +833,8 @@ def test_cloud_flow():
     assert fake.paths() == ["/api/experiment/models/checkpoints", "/api/prompt", "/api/jobs/job-1",
                             "/api/jobs/job-1", "/api/jobs/job-1", "/api/view", "/out.png"]
     body = fake.bodies[0]
-    assert set(body) == {"prompt"}  # Cloud 的请求体没有 prompt_id / client_id
+    # Cloud 的请求体没有 prompt_id / client_id；付费 API 节点需要的 comfy.org Key 与 X-API-Key 相同，自动带上
+    assert set(body) == {"prompt", "extra_data"} and body["extra_data"] == {"api_key_comfy_org": "comfyui-key"}
     assert body["prompt"]["4"]["inputs"]["ckpt_name"] == "sdxl_cloud.safetensors"
     assert body["prompt"]["5"]["inputs"]["width"] == 1024
     for request in fake.requests:
@@ -773,6 +847,24 @@ def test_cloud_flow():
 
 def test_cloud_list_models():
     assert run(CLOUD, FakeCloud(), action="models") == ["sdxl_cloud.safetensors", "flux.safetensors"]
+
+
+def test_cloud_partner_node_key_is_added_without_overriding_config():
+    # 官方文档：直接调用 Cloud API 时，付费 API 节点要在 extra_data.api_key_comfy_org 中带上 Key（与 X-API-Key 相同）
+    extra = {"extra_data": {"api_key_comfy_org": "comfyui-other", "x": 1}, "front": True}
+    section = {**CLOUD, "model": "m", "extra_body": extra}
+    fake = FakeCloud()
+    run(section, fake, DrawRequest("1girl"))
+    assert fake.bodies[0]["extra_data"] == {"api_key_comfy_org": "comfyui-other", "x": 1}  # 配置中的值优先
+    fake = FakeCloud()
+    run({**CLOUD, "model": "m", "extra_body": {"extra_data": {"x": 1}}}, fake, edit_req(jpeg()))
+    assert fake.bodies[0]["extra_data"] == {"api_key_comfy_org": "comfyui-key", "x": 1}
+    assert extra == {"extra_data": {"api_key_comfy_org": "comfyui-other", "x": 1}, "front": True}  # 不修改配置
+    # 本地 ComfyUI 的 api_key 是反向代理的 Key，不能当作 comfy.org Key 放进请求体
+    fake = FakeComfy()
+    run({"model": "m", "api_key": "proxy-secret"}, fake)
+    prompt = next(r for r in fake.requests if r.url.path == "/prompt")
+    assert "extra_data" not in fake.bodies[0] and b"proxy-secret" not in prompt.content
 
 
 @pytest.mark.parametrize(("status", "expected"), [(402, "余额不足"), (429, "订阅未激活")])
@@ -854,6 +946,541 @@ def test_cloud_timeout_dequeues_and_interrupts(monkeypatch):
     assert json.loads(queue.content) == {"delete": ["job-1"]}
 
 
+# ---------------------------------------------------------------- 图片修改
+
+
+def jpeg(width=1200, height=800, data=JPG) -> InputImage:
+    return InputImage(data, "image/jpeg", width, height)
+
+
+def edit_req(*images, orientation="landscape", strength=0.45, prompt="1girl, night sky", negative="lowres"):
+    return DrawRequest(prompt, negative, orientation, seed=42, images=list(images), strength=strength)
+
+
+def upload_name(data: bytes, ext: str) -> str:
+    return f"multidraw_{hashlib.sha256(data).hexdigest()[:32]}{ext}"
+
+
+def test_edit_builtin_img2img_request_shape():
+    fake = FakeComfy()
+    result = run({}, fake, edit_req(jpeg(1200, 800)))
+    body = fake.bodies[0]
+    pid = body["prompt_id"]
+    # 先确定模型（不发多余的上传），再上传图片、提交工作流、轮询、下载
+    assert fake.paths() == ["/models/checkpoints", "/upload/image", "/prompt", f"/history/{pid}", f"/history/{pid}",
+                            "/view"]
+    upload = next(r for r in fake.requests if r.url.path == "/upload/image")
+    assert upload.headers["content-type"].startswith("multipart/form-data; boundary=")
+    name = upload_name(JPG, ".jpg")
+    assert fake.uploads == [({"type": "input", "overwrite": "false", "subfolder": "astrbot"},
+                             {"image": (name, "image/jpeg", JPG)})]
+    graph = body["prompt"]
+    assert set(graph) == {"3", "4", "6", "7", "8", "9", "10", "11", "12"}  # 没有 EmptyLatentImage
+    assert graph["10"] == {"class_type": "LoadImage", "inputs": {"image": f"astrbot/{name}"}}
+    assert graph["11"] == {"class_type": "ImageScaleToTotalPixels", "inputs": {
+        "image": ["10", 0], "upscale_method": "lanczos", "megapixels": 0.96, "resolution_steps": 8}}
+    assert graph["12"]["inputs"] == {"pixels": ["11", 0], "vae": ["4", 2]}
+    sampler = graph["3"]["inputs"]
+    assert (sampler["denoise"], sampler["latent_image"], sampler["seed"]) == (0.45, ["12", 0], 42)
+    assert (sampler["steps"], sampler["cfg"], sampler["sampler_name"], sampler["scheduler"]) == \
+        (25, 7.0, "dpmpp_2m", "karras")
+    assert graph["4"]["inputs"]["ckpt_name"] == CHECKPOINTS[0]
+    assert graph["6"]["inputs"]["text"] == "1girl, night sky" and graph["7"]["inputs"]["text"] == "lowres"
+    assert graph["9"]["inputs"]["filename_prefix"] == "astrbot/edit"
+    assert all("authorization" not in r.headers for r in fake.requests)
+    assert result.image == PNG and result.text == ""
+    # 1200x800 按 0.96 百万像素、对齐到 8 缩放后为 1232x816（与 ImageScaleToTotalPixels 一致，保持原图比例）
+    assert result.params == {
+        "mode": "edit", "model": CHECKPOINTS[0], "size": "1232x816", "seed": 42, "input_images": 1,
+        "workflow": "builtin-img2img", "prompt_id": pid, "strength": 0.45, "steps": 25, "cfg": 7.0,
+        "sampler": "dpmpp_2m", "scheduler": "karras",
+    }
+
+
+@pytest.mark.parametrize(("strength", "expected"), [(0.0, 0.6), (0.2, 0.2), (0.456, 0.46), (1.5, 0.6),
+                                                     (-1, 0.6), (0.004, 0.01), ("abc", 0.6)])
+def test_edit_strength_default_and_range(strength, expected):
+    fake = FakeComfy()
+    result = run({"model": "m"}, fake, edit_req(jpeg(), strength=strength))
+    assert graph_of(fake)["3"]["inputs"]["denoise"] == expected and result.params["strength"] == expected
+
+
+def test_edit_keeps_aspect_or_crops_to_requested_orientation():
+    # 方向与原图一致（main.py 默认按原图推断）：保持原图比例，总像素按该方向的尺寸设置
+    fake = FakeComfy()
+    result = run({"model": "m", "square_size": "1024x1024"}, fake, edit_req(jpeg(1000, 1000), orientation="square"))
+    assert graph_of(fake)["11"]["inputs"]["megapixels"] == 1.0 and result.params["size"] == "1024x1024"
+
+    # 明确要求了与原图不同的方向：居中裁切到该方向的尺寸
+    fake = FakeComfy()
+    result = run({"model": "m"}, fake, edit_req(jpeg(1200, 800), orientation="portrait"))
+    assert graph_of(fake)["11"] == {"class_type": "ImageScale", "inputs": {
+        "image": ["10", 0], "upscale_method": "lanczos", "width": 832, "height": 1216, "crop": "center"}}
+    assert graph_of(fake)["12"]["inputs"]["pixels"] == ["11", 0] and result.params["size"] == "832x1216"
+
+    # 不知道原图尺寸：仍按总像素缩放（保持原图比例）
+    fake = FakeComfy()
+    result = run({"model": "m"}, fake, edit_req(jpeg(0, 0), orientation="portrait"))
+    assert graph_of(fake)["11"]["class_type"] == "ImageScaleToTotalPixels" and result.params["size"] == "0.96MP"
+
+
+def test_edit_transparent_png_is_flattened_on_white():
+    fake = FakeComfy()
+    png = InputImage(PNG, "image/png", 512, 768)
+    result = run({"model": "m"}, fake, edit_req(png, orientation="portrait"))
+    graph = graph_of(fake)
+    assert fake.uploads[0][1]["image"] == (upload_name(PNG, ".png"), "image/png", PNG)
+    comp_id = next(k for k, node in graph.items() if node["class_type"] == "ImageCompositeMasked")
+    comp = graph[comp_id]["inputs"]
+    white, invert = comp["destination"][0], comp["mask"][0]
+    assert graph[white] == {"class_type": "EmptyImage", "inputs": {
+        "width": 512, "height": 768, "batch_size": 1, "color": 0xFFFFFF}}
+    assert graph[invert] == {"class_type": "InvertMask", "inputs": {"mask": ["10", 1]}}
+    assert comp["source"] == ["10", 0] and comp["resize_source"] is True
+    assert graph["11"]["inputs"]["image"] == [comp_id, 0]  # 缩放节点改为读取合成后的图片
+    assert result.params["alpha"] == "white" and result.params["size"] == "816x1232"
+    # JPEG（没有透明通道）不插入合成节点
+    fake = FakeComfy()
+    result = run({"model": "m"}, fake, edit_req(jpeg()))
+    assert "ImageCompositeMasked" not in json.dumps(graph_of(fake)) and "alpha" not in result.params
+
+
+@pytest.mark.parametrize("workflow", ["{}", "  ", json.dumps({"prompt": comfyui.DEFAULT_EDIT_WORKFLOW})],
+                         ids=["empty-object", "blank", "pasted-builtin"])
+def test_edit_empty_or_builtin_workflow_config_is_treated_as_builtin(workflow):
+    # 修改工作流填 "{}" 或粘贴了内置工作流时实际运行的是内置工作流：同样铺白底、换方向时裁切，记录为 builtin
+    fake = FakeComfy()
+    png = InputImage(PNG, "image/png", 1200, 800)
+    result = run({"model": "m", "edit_workflow_json": workflow}, fake, edit_req(png, orientation="portrait"))
+    graph = graph_of(fake)
+    assert result.params["workflow"] == "builtin-img2img" and result.params["alpha"] == "white"
+    assert graph["11"]["class_type"] == "ImageScale" and result.params["size"] == "832x1216"
+    assert "ImageCompositeMasked" in json.dumps(graph)
+
+
+def test_edit_extra_images_are_trimmed_with_note():
+    fake = FakeComfy()
+    images = [jpeg(), jpeg(data=JPG + b"2"), jpeg(data=JPG + b"3")]
+    result = run({"model": "m"}, fake, edit_req(*images))
+    assert len(fake.uploads) == 1 and fake.uploads[0][1]["image"][2] == JPG  # 内置工作流只用第 1 张
+    assert result.params["input_images"] == 1 and result.params["ignored_images"] == 2
+    assert "只使用前 1 张图片，其余 2 张已忽略" in result.text
+
+
+QWEN_EDIT = {
+    "1": {"class_type": "LoadImage", "inputs": {"image": "{{image1}}"}},
+    "2": {"class_type": "LoadImage", "inputs": {"image": "{{image2}}"}},
+    "3": {"class_type": "LoadImage", "inputs": {"image": "{{image3}}"}},
+    "31": {"class_type": "ImageScale", "inputs": {"image": ["3", 0], "upscale_method": "area", "width": 512,
+                                                   "height": 512, "crop": "disabled"}},
+    "20": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen.safetensors", "type": "qwen_image"}},
+    "21": {"class_type": "VAELoader", "inputs": {"vae_name": "qwen_image_vae.safetensors"}},
+    "22": {"class_type": "UNETLoader", "inputs": {"unet_name": "qie.safetensors", "weight_dtype": "default"}},
+    "4": {"class_type": "TextEncodeQwenImageEditPlus", "inputs": {
+        "clip": ["20", 0], "vae": ["21", 0], "prompt": "{{prompt}}",
+        "image1": ["1", 0], "image2": ["2", 0], "image3": ["31", 0]}},
+    "5": {"class_type": "TextEncodeQwenImageEditPlus", "inputs": {
+        "clip": ["20", 0], "vae": ["21", 0], "prompt": "", "image1": ["1", 0]}},
+    "6": {"class_type": "EmptySD3LatentImage", "inputs": {"width": 1024, "height": 1024, "batch_size": 1}},
+    "7": {"class_type": "KSampler", "inputs": {"model": ["22", 0], "positive": ["4", 0], "negative": ["5", 0],
+                                               "latent_image": ["6", 0], "seed": 1, "steps": 8, "cfg": 1.0,
+                                               "sampler_name": "euler", "scheduler": "simple", "denoise": 1.0}},
+    "8": {"class_type": "VAEDecode", "inputs": {"samples": ["7", 0], "vae": ["21", 0]}},
+    "9": {"class_type": "SaveImage", "inputs": {"images": ["8", 0], "filename_prefix": "qie"}},
+}
+
+
+def test_edit_custom_multi_image_workflow_prunes_unused_slots():
+    section = {"edit_workflow_json": json.dumps(QWEN_EDIT), "model": "unused.safetensors"}
+    backend = ComfyUIBackend(section)
+    assert backend.max_edit_images == 3 and backend.supports_strength is False and backend.edit_missing() == ""
+    fake = FakeComfy()
+    second = InputImage(PNG, "image/png", 0, 0)
+    result = run(section, fake, edit_req(jpeg(1200, 800), second, prompt="put the cat from image 2 on the sofa"))
+    graph = graph_of(fake)
+    # 只发了 2 张图：第 3 个加载节点和只为它服务的缩放节点被删除，编码节点只丢了可选的 image3，保留
+    assert "3" not in graph and "31" not in graph
+    assert set(graph["4"]["inputs"]) == {"clip", "vae", "prompt", "image1", "image2"}
+    names = [files["image"][0] for _, files in fake.uploads]
+    assert names == [upload_name(JPG, ".jpg"), upload_name(PNG, ".png")]
+    assert graph["1"]["inputs"]["image"] == f"astrbot/{names[0]}" and graph["2"]["inputs"]["image"] == f"astrbot/{names[1]}"
+    assert graph["4"]["inputs"]["prompt"] == "put the cat from image 2 on the sofa"
+    # 固定种子被替换；没有 {{width}} / {{height}} 时按第 1 张图的比例设置 Empty Latent（对齐到 64）
+    assert graph["7"]["inputs"]["seed"] == 42 and graph["7"]["inputs"]["denoise"] == 1.0
+    assert (graph["6"]["inputs"]["width"], graph["6"]["inputs"]["height"]) == (1216, 832)
+    assert "ImageCompositeMasked" not in json.dumps(graph)  # 自定义工作流不插入白底合成节点
+    assert "/models/checkpoints" not in fake.paths() and fake.object_info_calls > 0
+    assert result.params == {"mode": "edit", "model": "", "size": "1216x832", "seed": 42, "input_images": 2,
+                             "workflow": "custom-edit", "prompt_id": fake.bodies[0]["prompt_id"]}
+
+    # /object_info 的结果有缓存：再次修改不重复查询
+    fake = FakeComfy()
+    run(section, fake, edit_req(jpeg()))
+    assert fake.object_info_calls == 0 and "2" not in graph_of(fake) and len(fake.uploads) == 1
+
+
+FLUX2_EDIT = {
+    "L1": {"class_type": "LoadImage", "inputs": {"image": "{{image1}}"}},
+    "L2": {"class_type": "LoadImage", "inputs": {"image": "{{image2}}"}},
+    "S1": {"class_type": "ImageScaleToTotalPixels", "inputs": {"image": ["L1", 0], "upscale_method": "lanczos",
+                                                               "megapixels": 1.0, "resolution_steps": 1}},
+    "S2": {"class_type": "ImageScaleToTotalPixels", "inputs": {"image": ["L2", 0], "upscale_method": "lanczos",
+                                                               "megapixels": 1.0, "resolution_steps": 1}},
+    "E1": {"class_type": "VAEEncode", "inputs": {"pixels": ["S1", 0], "vae": ["V", 0]}},
+    "E2": {"class_type": "VAEEncode", "inputs": {"pixels": ["S2", 0], "vae": ["V", 0]}},
+    "V": {"class_type": "VAELoader", "inputs": {"vae_name": "flux2-vae.safetensors"}},
+    "C": {"class_type": "CLIPLoader", "inputs": {"clip_name": "mistral.safetensors", "type": "flux2"}},
+    "T": {"class_type": "CLIPTextEncode", "inputs": {"text": "{{prompt}}", "clip": ["C", 0]}},
+    "R1": {"class_type": "ReferenceLatent", "inputs": {"conditioning": ["T", 0], "latent": ["E1", 0]}},
+    "R2": {"class_type": "ReferenceLatent", "inputs": {"conditioning": ["R1", 0], "latent": ["E2", 0]}},
+    "U": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux2.safetensors", "weight_dtype": "default"}},
+    "K": {"class_type": "KSampler", "inputs": {"model": ["U", 0], "positive": ["R2", 0], "negative": ["T", 0],
+                                               "latent_image": ["EL", 0], "seed": 1, "steps": 20, "cfg": 1.0,
+                                               "sampler_name": "euler", "scheduler": "simple", "denoise": 1.0}},
+    "EL": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024, "height": 1024, "batch_size": 1}},
+    "D": {"class_type": "VAEDecode", "inputs": {"samples": ["K", 0], "vae": ["V", 0]}},
+    "O": {"class_type": "SaveImage", "inputs": {"images": ["D", 0], "filename_prefix": "x"}},
+}
+
+
+def test_edit_pruning_follows_required_inputs():
+    section = {"edit_workflow_json": json.dumps(FLUX2_EDIT)}
+    fake = FakeComfy()
+    run(section, fake, edit_req(jpeg()))
+    graph = graph_of(fake)
+    # VAEEncode 丢了必填的 pixels → 一起删除；ReferenceLatent 只丢了可选的 latent → 保留
+    assert not {"L2", "S2", "E2"} & set(graph)
+    assert graph["R2"]["inputs"] == {"conditioning": ["R1", 0]} and graph["K"]["inputs"]["positive"] == ["R2", 0]
+    assert any(r.url.path == "/object_info/VAEEncode" for r in fake.requests)
+
+    # 查不到 /object_info（如旧版或反向代理拦截）时退回「没有连线就删」
+    comfyui._REQUIRED_CACHE.clear()
+    fake = FakeComfy(object_info_status=500)
+    run(section, fake, edit_req(jpeg()))
+    graph = graph_of(fake)
+    assert "S2" not in graph and graph["E2"]["inputs"] == {"vae": ["V", 0]}
+
+    # 第 2 张图连到了决定输出尺寸的必填输入：删到连 SaveImage 都没有时直接说明，不上传、不提交
+    needs_two = json.loads(json.dumps(FLUX2_EDIT))
+    needs_two["GS"] = {"class_type": "GetImageSize", "inputs": {"image": ["L2", 0]}}
+    needs_two["EL"]["inputs"].update(width=["GS", 0], height=["GS", 1])
+    comfyui._REQUIRED_CACHE.clear()
+    fake = FakeComfy()
+    with pytest.raises(DrawError) as info:
+        run({"edit_workflow_json": json.dumps(needs_two)}, fake, edit_req(jpeg()))
+    assert "只有 1 张图片时无法运行" in str(info.value) and "SaveImage" in str(info.value)
+    assert not fake.uploads and "/prompt" not in fake.paths()
+
+
+def test_edit_workflow_without_placeholders_fills_load_image_nodes_in_order():
+    workflow = json.loads(json.dumps(QWEN_EDIT).replace('"{{image1}}"', '"a.png"').replace('"{{image2}}"', '"b.png"'))
+    for key in ("3", "31"):
+        workflow.pop(key)
+    workflow["4"]["inputs"].pop("image3")
+    section = {"edit_workflow_json": workflow}  # 也接受已经是对象的配置
+    assert ComfyUIBackend(section).max_edit_images == 2
+    fake = FakeComfy()
+    run(section, fake, edit_req(jpeg()))
+    graph = graph_of(fake)
+    assert graph["1"]["inputs"]["image"].startswith("astrbot/multidraw_") and "2" not in graph
+    assert "image2" not in graph["4"]["inputs"] and workflow["1"]["inputs"]["image"] == "a.png"  # 不修改配置
+
+    # 超过 4 个 LoadImage 节点时最多使用前 4 个，其余保持原样（如固定的参考图）
+    many = {str(i): {"class_type": "LoadImage", "inputs": {"image": f"ref{i}.png"}} for i in range(1, 7)}
+    many["7"] = {"class_type": "CLIPTextEncode", "inputs": {"text": "{{prompt}}", "clip": ["1", 0]}}
+    assert ComfyUIBackend({"edit_workflow_json": json.dumps(many)}).max_edit_images == 4
+
+
+def test_edit_capabilities_and_edit_missing():
+    # 类属性是平台的最大能力，实例按当前配置计算
+    assert ComfyUIBackend.max_edit_images == comfyui.MAX_EDIT_IMAGES == 4
+    assert ComfyUIBackend.supports_strength is True and ComfyUIBackend.supports_balance is True
+    assert ComfyUIBackend.billing_url == comfyui.BILLING_URL and ComfyUIBackend.billing_url.startswith("https://")
+    default = ComfyUIBackend({})
+    assert default.max_edit_images == 1 and default.supports_strength is True and default.edit_missing() == ""
+    assert ComfyUIBackend(None).edit_missing() == ""
+    with_denoise = json.loads(json.dumps(QWEN_EDIT))
+    with_denoise["7"]["inputs"]["denoise"] = "{{denoise}}"
+    assert ComfyUIBackend({"edit_workflow_json": json.dumps(with_denoise)}).supports_strength is True
+    # 文生图工作流有误不影响修改图片
+    broken = ComfyUIBackend({"workflow_json": "{oops"})
+    assert broken.missing() and broken.edit_missing() == ""
+    # 没有 {{prompt}} 但采样器 positive 直接连着 CLIPTextEncode：生成时会自动填入，不算配置有误
+    wired = json.loads(json.dumps(comfyui.DEFAULT_EDIT_WORKFLOW))
+    wired["6"]["inputs"]["text"] = "a photo"
+    assert ComfyUIBackend({"edit_workflow_json": json.dumps(wired)}).edit_missing() == ""
+
+    cases = [
+        ({"edit_workflow_json": "{oops"}, "不是有效的 JSON"),
+        ({"edit_workflow_json": '{"nodes": [], "links": []}'}, "Save (API Format)"),
+        ({"edit_workflow_json": json.dumps(FLUX_WORKFLOW)}, "没有 {{image}} 占位符"),
+        ({"edit_workflow_json": '{"1": {"class_type": "LoadImage", "inputs": {"image": "{{image5}}"}}}'},
+         "最多使用 4 张图片"),
+        ({"edit_workflow_json": '{"1": {"class_type": "LoadImage", "inputs": {"image": "{{mask}}"}}}'},
+         "未知的占位符 {{mask}}"),
+        # Qwen-Image-Edit 的提示词输入叫 prompt，不能自动连线：没写 {{prompt}} 时生成必然失败，提前说明、不上传
+        ({"edit_workflow_json": json.dumps(QWEN_EDIT).replace('"{{prompt}}"', '"make it night"')},
+         "没有 {{prompt}} 占位符"),
+        ({"extra_body": "{bad"}, "额外请求参数"),
+        ({"base_url": "https://cloud.comfy.org"}, "Comfy Cloud API Key"),
+        ({"base_url": "http://[bad"}, "地址格式不正确"),
+    ]
+    for section, expected in cases:
+        backend = ComfyUIBackend(section)
+        assert expected in backend.edit_missing(), section
+        assert 1 <= backend.max_edit_images <= 4 and isinstance(backend.supports_strength, bool)
+        fake = FakeComfy()
+        with pytest.raises(DrawError) as info:
+            run(section, fake, edit_req(jpeg()))
+        assert expected in str(info.value) and fake.requests == [], section
+
+
+def test_text_workflow_rejects_edit_placeholders():
+    workflow = json.loads(json.dumps(comfyui.DEFAULT_WORKFLOW))
+    workflow["10"] = {"class_type": "LoadImage", "inputs": {"image": "{{image}}"}}
+    fake = FakeComfy()
+    with pytest.raises(DrawError) as info:
+        run({"workflow_json": json.dumps(workflow)}, fake)
+    assert "未知的占位符 {{image}}" in str(info.value) and "图片修改工作流" in str(info.value)
+    assert fake.requests == []
+    # 图片修改工作流里写在文字中的占位符按文字替换
+    edit = json.loads(json.dumps(comfyui.DEFAULT_EDIT_WORKFLOW))
+    edit["9"]["inputs"]["filename_prefix"] = "edit {{denoise}} {{megapixels}}"
+    fake = FakeComfy()
+    run({"model": "m", "edit_workflow_json": json.dumps(edit)}, fake, edit_req(jpeg(), strength=0.5))
+    assert graph_of(fake)["9"]["inputs"]["filename_prefix"] == "edit 0.5 0.96"
+
+
+def test_edit_upload_retries_and_errors():
+    # 上传按内容哈希命名、overwrite=false，5xx / 超时后重试不会产生重复文件
+    fake = FakeComfy(upload_fail=[500, 502])
+    assert run({"model": "m"}, fake, edit_req(jpeg())).image == PNG
+    assert len(fake.uploads) == 3 and len({files["image"][0] for _, files in fake.uploads}) == 1
+    assert fake.paths("POST").count("/prompt") == 1
+
+    calls = []
+    fake = FakeComfy()
+
+    def timeout_once(request):
+        if request.url.path == "/upload/image" and not calls:
+            calls.append(1)
+            raise httpx.ReadTimeout("timed out", request=request)
+        return fake(request)
+
+    assert run({"model": "m"}, timeout_once, edit_req(jpeg())).image == PNG and len(fake.uploads) == 1
+
+    fake = FakeComfy(upload_fail=[413])
+    with pytest.raises(DrawError) as info:
+        run({"model": "m"}, fake, edit_req(jpeg()))
+    assert info.value.status == 413 and "--max-upload-size" in str(info.value)
+    assert len(fake.uploads) == 1 and "/prompt" not in fake.paths()
+
+    fake = FakeComfy(upload_fail=[401])
+    with pytest.raises(DrawError) as info:
+        run({"model": "m", "api_key": "proxy-secret"}, fake, edit_req(jpeg()))
+    assert info.value.status == 401 and len(fake.uploads) == 1 and "proxy-secret" not in str(info.value)
+
+    fake = FakeComfy(upload_fail=[500, 500, 500])
+    with pytest.raises(DrawError) as info:
+        run({"model": "m"}, fake, edit_req(jpeg()))
+    assert info.value.status == 500 and len(fake.uploads) == comfyui.UPLOAD_ATTEMPTS and "/prompt" not in fake.paths()
+
+
+def test_edit_submit_errors_are_not_retried():
+    fake = FakeComfy(on_prompt=lambda request, body: httpx.Response(500, text="500 Internal Server Error"))
+    with pytest.raises(DrawError) as info:
+        run({"model": "m"}, fake, edit_req(jpeg()))
+    assert info.value.status == 500 and fake.paths("POST") == ["/upload/image", "/prompt"]
+
+    def invalid_image(request, body):
+        return httpx.Response(400, json={
+            "error": {"type": "prompt_outputs_failed_validation", "message": "Prompt outputs failed validation",
+                      "details": ""},
+            "node_errors": {"10": {"errors": [{"type": "custom_validation_failed",
+                                               "message": "Custom validation failed for node",
+                                               "details": "image - Invalid image file: astrbot/x.jpg",
+                                               "extra_info": {"input_name": "image"}}],
+                                   "class_type": "LoadImage"}}})
+
+    fake = FakeComfy(on_prompt=invalid_image)
+    with pytest.raises(DrawError) as info:
+        run({"model": "m"}, fake, edit_req(jpeg()))
+    assert "节点 #10 LoadImage.image" in str(info.value) and "Invalid image file" in str(info.value)
+    assert not info.value.retryable and fake.paths("POST") == ["/upload/image", "/prompt"]
+
+
+def test_edit_timeout_cancels_job(monkeypatch):
+    monkeypatch.setattr(comfyui, "time", FakeClock())
+    fake = FakeComfy(pending=10**9, in_queue=True)
+    with pytest.raises(DrawError) as info:
+        run({"model": "m"}, fake, edit_req(jpeg()))
+    pid = fake.bodies[0]["prompt_id"]
+    assert "超时" in str(info.value) and not info.value.retryable
+    assert fake.paths("POST") == ["/upload/image", "/prompt", f"/api/jobs/{pid}/cancel"]
+
+
+def test_moderation_refusal_gets_friendly_message():
+    entry = {"status": {"status_str": "error", "completed": False, "messages": [["execution_error", {
+        "node_id": "5", "node_type": "OpenAIGPTImage1", "exception_type": "Exception",
+        "exception_message": "Your request was rejected as a result of our safety system."}]]}}
+    with pytest.raises(DrawError) as info:
+        run({"model": "m"}, FakeComfy(entry=entry), edit_req(jpeg()))
+    assert "安全审核" in str(info.value) and "safety system" in str(info.value)
+
+
+def test_cloud_edit_flow():
+    fake = FakeCloud()
+    result = run({**CLOUD, "model": "sdxl.safetensors"}, fake, edit_req(jpeg()))
+    assert fake.paths() == ["/api/upload/image", "/api/prompt", "/api/jobs/job-1", "/api/jobs/job-1",
+                            "/api/jobs/job-1", "/api/view", "/out.png"]
+    upload = fake.requests[0]
+    assert str(upload.url) == "https://cloud.comfy.org/api/upload/image"
+    assert upload.headers["x-api-key"] == "comfyui-key" and "authorization" not in upload.headers
+    # Cloud 不写 type 时默认 output；subfolder 被忽略，不发送
+    assert fake.uploads == [({"type": "input", "overwrite": "false"},
+                             {"image": (upload_name(JPG, ".jpg"), "image/jpeg", JPG)})]
+    body = fake.bodies[0]
+    assert set(body) == {"prompt", "extra_data"} and body["prompt"]["10"]["inputs"]["image"] == "0f1e2d3c4b5a.jpg"
+    assert result.params["mode"] == "edit" and result.params["prompt_id"] == "job-1"
+
+    # Cloud 只提供整表 /api/object_info
+    fake = FakeCloud()
+    run({**CLOUD, "edit_workflow_json": json.dumps(FLUX2_EDIT)}, fake, edit_req(jpeg()))
+    assert fake.paths("GET").count("/api/object_info") == 1 and "E2" not in fake.bodies[0]["prompt"]
+
+    # 订阅未激活（429）不重试
+    fake = FakeCloud()
+    fake.upload_status = 429
+    with pytest.raises(DrawError) as info:
+        run({**CLOUD, "model": "m"}, fake, edit_req(jpeg()))
+    assert info.value.status == 429 and "订阅未激活" in str(info.value) and len(fake.uploads) == 1
+    assert "/api/prompt" not in fake.paths()
+
+
+# ---------------------------------------------------------------- 余额
+
+
+TIMESERIES = {"group_by": "model", "granularity": "month", "groups": [], "buckets": [], "breakdown": [],
+              "summary": {"spend_micros": 3210000, "balance": {
+                  "amount_micros": 4250, "prepaid_balance_micros": 2250, "cloud_credit_balance_micros": 2000,
+                  "currency": "USD"}}}
+PLATFORM_BALANCE = {"amount_micros": 1234.25, "amount_cents": 1234.25, "currency": "usd",
+                    "prepaid_balance_cents": 1000, "cloud_credit_balance_cents": 234.25}
+
+
+class FakeBilling:
+    def __init__(self, *, timeseries=TIMESERIES, timeseries_status=200, platform=PLATFORM_BALANCE,
+                 platform_status=200):
+        self.timeseries, self.timeseries_status = timeseries, timeseries_status
+        self.platform, self.platform_status = platform, platform_status
+        self.requests: list[httpx.Request] = []
+
+    def urls(self):
+        return [f"{r.method} {r.url.host}{r.url.path}" for r in self.requests]
+
+    def __call__(self, request):
+        self.requests.append(request)
+        host, path = request.url.host, request.url.path
+        if host == "cloud.comfy.org" and path == "/api/billing/usage/timeseries":
+            if self.timeseries_status != 200:
+                return httpx.Response(self.timeseries_status, json={"code": "ERR", "message": "billing failed"})
+            return httpx.Response(200, json=self.timeseries)
+        if host == "api.comfy.org" and path == "/customers/balance":
+            if self.platform_status != 200:
+                return httpx.Response(self.platform_status, json={"error": "e", "message": "Customer not found"
+                                                                  if self.platform_status == 404 else "Invalid Comfy API key"})
+            return httpx.Response(200, json=self.platform)
+        return httpx.Response(404, json={"message": "Not found"})
+
+
+PLATFORM_ITEMS = [("剩余额度", "$12.34（约 2,604 积分）"), ("订阅赠送额度", "$2.34"), ("充值额度", "$10.00")]
+
+
+def test_cloud_balance_from_usage_timeseries():
+    fake = FakeBilling()
+    info = run(CLOUD, fake, action="balance")
+    assert info.items == [("剩余额度", "$42.50（约 8,968 积分）"), ("订阅赠送额度", "$20.00"), ("充值额度", "$22.50"),
+                          ("近一个月消费", "$3.21")]
+    assert "账单" in info.note
+    assert fake.urls() == ["GET cloud.comfy.org/api/billing/usage/timeseries"]
+    request = fake.requests[0]
+    assert dict(request.url.params) == {"granularity": "month", "months": "1"}
+    assert request.headers["x-api-key"] == "comfyui-key" and "authorization" not in request.headers
+    assert "comfyui-key" not in json.dumps(info.items, ensure_ascii=False) + info.note
+
+
+@pytest.mark.parametrize(("timeseries", "status", "timeseries_calls"), [
+    ({"summary": {"spend_micros": 0}}, 200, 1),  # 读不到余额时省略 summary.balance
+    ({"groups": []}, 200, 1),
+    (TIMESERIES, 500, 2),  # 5xx 重试一次后改用 api.comfy.org
+    (TIMESERIES, 404, 1),
+])
+def test_cloud_balance_falls_back_to_platform(timeseries, status, timeseries_calls):
+    fake = FakeBilling(timeseries=timeseries, timeseries_status=status)
+    info = run(CLOUD, fake, action="balance")
+    assert info.items == PLATFORM_ITEMS and "团队" in info.note
+    assert fake.urls() == ["GET cloud.comfy.org/api/billing/usage/timeseries"] * timeseries_calls + \
+        ["GET api.comfy.org/customers/balance"]
+    assert fake.requests[-1].headers["x-api-key"] == "comfyui-key"
+
+
+@pytest.mark.parametrize("status", [400, 401, 402, 429])
+def test_cloud_balance_key_errors_are_raised(status):
+    fake = FakeBilling(timeseries_status=status)
+    with pytest.raises(DrawError) as info:
+        run(CLOUD, fake, action="balance")
+    assert info.value.status == status and "comfyui-key" not in str(info.value)
+    assert fake.urls() == ["GET cloud.comfy.org/api/billing/usage/timeseries"]  # 不重试，也不换接口
+
+
+def test_local_balance_uses_comfy_org_key_from_extra_body():
+    section = {"api_key": "proxy-secret",
+               "extra_body": json.dumps({"extra_data": {"api_key_comfy_org": "comfyui-local"}})}
+    assert ComfyUIBackend(section).balance_missing() == ""
+    fake = FakeBilling()
+    info = run(section, fake, action="balance")
+    assert info.items == PLATFORM_ITEMS and "共用" in info.note and "团队" not in info.note
+    assert fake.urls() == ["GET api.comfy.org/customers/balance"]
+    # 只发送 comfy.org 的 Key，反向代理的 Key 不会发给 api.comfy.org
+    assert fake.requests[0].headers["x-api-key"] == "comfyui-local" and "authorization" not in fake.requests[0].headers
+
+    fake = FakeBilling(platform_status=404)
+    with pytest.raises(DrawError) as info:
+        run(section, fake, action="balance")
+    assert info.value.status == 404 and "还没有积分账户" in str(info.value)
+
+    fake = FakeBilling(platform_status=401)
+    with pytest.raises(DrawError) as info:
+        run(section, fake, action="balance")
+    message = str(info.value)
+    assert info.value.status == 401 and "extra_data.api_key_comfy_org" in message
+    assert "comfyui-local" not in message and "proxy-secret" not in message
+
+
+def test_balance_missing_cases():
+    local = ComfyUIBackend({})
+    assert "不计费" in local.balance_missing() and local.supports_balance is True
+    assert "不计费" in ComfyUIBackend({"extra_body": "{bad"}).balance_missing()
+    assert "不计费" in ComfyUIBackend({"extra_body": '{"extra_data": {"api_key_comfy_org": ""}}'}).balance_missing()
+    assert "Comfy Cloud API Key" in ComfyUIBackend({"base_url": "https://cloud.comfy.org"}).balance_missing()
+    assert ComfyUIBackend(CLOUD).balance_missing() == ""
+    fake = FakeBilling()
+    with pytest.raises(DrawError) as info:
+        run({}, fake, action="balance")
+    assert "不计费" in str(info.value) and fake.requests == []
+
+
+def test_balance_items_formatting():
+    assert comfyui.balance_items({"amount_cents": -123, "currency": "usd"}) == [("剩余额度", "-$1.23（约 -260 积分）")]
+    assert comfyui.balance_items({"amount_micros": 500, "currency": "eur"}) == [("剩余额度", "5.00 EUR")]
+    # *_cents 优先于已废弃的 *_micros；可选字段按需显示
+    items = comfyui.balance_items({"amount_cents": 100, "amount_micros": 999, "pending_charges_cents": 25,
+                                   "effective_balance_cents": 75, "prepaid_balance_micros": True})
+    assert items == [("剩余额度", "$1.00（约 211 积分）"), ("待结算费用", "$0.25"), ("扣除待结算后", "$0.75")]
+    with pytest.raises(DrawError):
+        comfyui.balance_items({"currency": "usd"})
+
+
 # ---------------------------------------------------------------- 配置 schema
 
 
@@ -893,3 +1520,45 @@ def test_schema_section_matches_code():
             run(section, fake, DrawRequest("1girl", "lowres", orientation, seed=11))
             graphs.append(graph_of(fake))
     assert graphs[:3] == graphs[3:]
+
+
+def test_schema_edit_and_balance_fields_match_code():
+    items = schema_items()
+    keys = list(items)
+    assert keys.index("edit_workflow_json") == keys.index("workflow_json") + 1
+    field = items["edit_workflow_json"]
+    assert field["type"] == "text" and field["default"] == "" and field["editor_mode"] is True
+    assert field["editor_language"] == "json" and "secret" not in field
+    assert "{{image}}" in field["hint"] and f"{{{{image{comfyui.MAX_EDIT_IMAGES}}}}}" in field["hint"]
+    assert "{{denoise}}" in field["hint"] and "{{megapixels}}" in field["hint"]
+    assert "修改图片" in items["model"]["hint"] and "余额" in items["api_key"]["hint"]
+    assert "余额" in items["extra_body"]["hint"]
+    # 没有新增只用于查询余额的密钥：Cloud 用 api_key，本地用 extra_body 中的 comfy.org Key
+    assert [name for name, f in items.items() if f.get("secret")] == ["api_key"]
+
+    defaults = {name: f["default"] for name, f in items.items()}
+    backend = ComfyUIBackend(defaults)
+    assert backend.edit_missing() == "" and backend.max_edit_images == 1 and backend.supports_strength is True
+    assert not backend.custom_edit_workflow and "不计费" in backend.balance_missing()
+    graphs, params = [], []
+    for section in (defaults, {}):
+        fake = FakeComfy()
+        params.append(run(section, fake, edit_req(jpeg())).params)
+        graphs.append(graph_of(fake))
+    assert graphs[0] == graphs[1] and params[0]["size"] == params[1]["size"] == "1232x816"
+
+
+def test_edit_not_blocked_by_broken_text_to_image_workflow():
+    backend = ComfyUIBackend({"workflow_json": "{not json"})
+    assert "JSON" in backend.missing()  # 文生图仍然报告工作流错误
+    assert backend.edit_ready_missing() == "" and backend.edit_missing() == ""  # 修改图片不受影响
+
+
+def test_plan_is_edit_aware():
+    backend = ComfyUIBackend({})
+    req = DrawRequest("x", orientation="landscape", images=[InputImage(b"\x89PNG", "image/png", 1600, 900)])
+    plan = backend.plan(req)
+    assert plan["mode"] == "edit" and plan["input_images"] == 1
+    assert plan["size"] != backend.plan(DrawRequest("x", orientation="landscape"))["size"]
+    unknown = backend.plan(DrawRequest("x", orientation="landscape", images=[InputImage(b"\x89PNG", "image/png")]))
+    assert unknown["size"].endswith("MP")

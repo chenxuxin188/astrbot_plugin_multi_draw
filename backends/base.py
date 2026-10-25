@@ -38,11 +38,45 @@ class DrawError(Exception):
 
 
 @dataclass
+class InputImage:
+    """图片修改时用户提供的图片。插件已统一转成 PNG（有透明通道时）或 JPEG，并限制了尺寸。"""
+
+    data: bytes
+    mime: str
+    width: int = 0
+    height: int = 0
+
+
+@dataclass
 class DrawRequest:
     prompt: str
     negative: str = ""
     orientation: str = "portrait"  # portrait / landscape / square
     seed: int = 0  # 0 表示随机（后端不支持种子时忽略）
+    # 图片修改：非空时按这些图片和提示词生成修改后的图片
+    images: list[InputImage] = field(default_factory=list)
+    # 重绘幅度（0-1，NovelAI / ComfyUI 等图生图后端使用），0 表示使用后端配置的默认值
+    strength: float = 0.0
+
+    @property
+    def is_edit(self) -> bool:
+        return bool(self.images)
+
+
+def image_orientation(image: InputImage) -> str:
+    """按图片宽高判断方向，宽高接近时视为方图；不知道尺寸时返回空串。"""
+    if not image.width or not image.height:
+        return ""
+    ratio = image.width / image.height
+    return "landscape" if ratio > 1.15 else "portrait" if ratio < 0.87 else "square"
+
+
+@dataclass
+class BalanceInfo:
+    """余额查询结果：items 为 (名称, 数值) 列表，如 ("剩余额度", "12.34 美元")。"""
+
+    items: list[tuple[str, str]] = field(default_factory=list)
+    note: str = ""
 
 
 @dataclass
@@ -454,7 +488,8 @@ class Clients:
 class Backend:
     """绘图后端基类。每次绘图都按当前配置新建实例，因此实例本身不保存连接。
 
-    子类需要设置类属性，并实现 missing() 与 generate()；支持列出模型时实现 list_models()。
+    子类需要设置类属性，并实现 missing() 与 generate()；支持列出模型时实现 list_models()，
+    支持图片修改时设置 max_edit_images 并在 generate() 中处理 req.images，支持余额查询时实现 balance()。
     """
 
     key: ClassVar[str] = ""
@@ -464,9 +499,17 @@ class Backend:
     # 接口原生支持负面提示词；不支持时负面内容会以文字形式附加到提示词末尾
     supports_negative: ClassVar[bool] = False
     supports_models: ClassVar[bool] = False
+    # 图片修改最多接受的输入图片数；0 表示不支持图片修改
+    # 类属性是该平台的最大能力；实例可以按当前配置的模型改成更小的值，调用方应从实例上读取
+    max_edit_images: int = 0
+    # 图片修改使用重绘幅度（req.strength，图生图）而不是修改指令
+    supports_strength: ClassVar[bool] = False
+    supports_balance: ClassVar[bool] = False
     # 同时进行的请求数上限；None 表示使用插件的全局设置
     max_concurrency: ClassVar[int | None] = None
     doc_url: ClassVar[str] = ""
+    # 查看余额 / 账单的官方页面，不支持余额查询时提示用户去这里查看
+    billing_url: str = ""
 
     def __init__(self, section: dict | None):
         self.section = section if isinstance(section, dict) else {}
@@ -479,6 +522,15 @@ class Backend:
         """配置中可以覆盖提示词方式（目前只有 ComfyUI 提供该选项）。"""
         mode = as_str(self.section.get("prompt_mode")).lower()
         return mode if mode in ("tags", "natural") else self.default_prompt_mode
+
+    @property
+    def edit_prompt_mode(self) -> str:
+        """修改图片时的提示词方式：配置了 edit_prompt_mode 时使用它，否则与绘图相同。
+
+        例如 ComfyUI 绘图用 SDXL（标签），修改图片用 Qwen-Image-Edit 等工作流（自然语言修改指令）。
+        """
+        mode = as_str(self.section.get("edit_prompt_mode")).lower()
+        return mode if mode in ("tags", "natural") else self.prompt_mode
 
     @property
     def proxy(self) -> str:
@@ -501,6 +553,29 @@ class Backend:
 
     async def list_models(self, clients: Clients) -> list[str]:
         raise DrawError(f"{self.label} 不支持获取模型列表")
+
+    def edit_ready_missing(self) -> str:
+        """修改图片前的基本配置检查（Key、地址等），默认与 missing() 相同。
+
+        ComfyUI 等文生图和修改图片使用不同配置的后端可以覆盖：文生图配置有误不影响修改图片。
+        """
+        return self.missing()
+
+    def edit_missing(self) -> str:
+        """当前配置不能修改图片时返回原因（如所选模型不支持），可以修改时返回空串。"""
+        if not self.max_edit_images:
+            return f"{self.label} 暂不支持修改图片"
+        return ""
+
+    def balance_missing(self) -> str:
+        """余额查询缺少的配置（如需要单独的管理密钥），配置完整时返回空串。"""
+        if not self.supports_balance:
+            where = f"，请到 {self.billing_url} 查看" if self.billing_url else ""
+            return f"{self.label} 没有提供查询余额的接口{where}"
+        return self.missing()
+
+    async def balance(self, clients: Clients) -> BalanceInfo:
+        raise DrawError(self.balance_missing() or f"{self.label} 不支持查询余额")
 
     def plan(self, req: DrawRequest) -> dict:
         """生成前预计使用的参数，写入绘图记录：生成失败时记录中也有模型和尺寸，成功后以实际参数为准。

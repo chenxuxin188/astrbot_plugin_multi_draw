@@ -43,10 +43,10 @@ def create_backend(key: str, section: dict | None) -> Backend:
     return cls(section)
 
 
-def backend_missing(backend: Backend) -> str:
-    """missing() 出错时返回错误说明，避免一个平台的错误配置影响状态查询和设置页面。"""
+def backend_missing(backend: Backend, edit: bool = False) -> str:
+    """missing()（修改图片时为 edit_ready_missing()）出错时返回错误说明，避免一个平台的错误配置影响状态查询和设置页面。"""
     try:
-        return backend.missing()
+        return backend.edit_ready_missing() if edit else backend.missing()
     except Exception as e:
         return f"{backend.label} 配置有误：{str(e).strip() or type(e).__name__}"
 
@@ -56,6 +56,22 @@ def backend_summary(backend: Backend) -> str:
         return backend.summary()
     except Exception as e:
         return f"{backend.label}（配置有误：{str(e).strip() or type(e).__name__}）"
+
+
+def backend_edit_missing(backend: Backend) -> str:
+    """不能修改图片的原因（不支持或缺少配置）；可以修改时返回空串。"""
+    try:
+        return backend.edit_missing()
+    except Exception as e:
+        return f"{backend.label} 配置有误：{str(e).strip() or type(e).__name__}"
+
+
+def backend_balance_missing(backend: Backend) -> str:
+    """不能查询余额的原因；可以查询时返回空串。"""
+    try:
+        return backend.balance_missing()
+    except Exception as e:
+        return f"{backend.label} 配置有误：{str(e).strip() or type(e).__name__}"
 
 
 __all__ = [
@@ -68,6 +84,8 @@ __all__ = [
     "DrawRequest",
     "DrawResult",
     "HttpPool",
+    "backend_balance_missing",
+    "backend_edit_missing",
     "backend_missing",
     "backend_summary",
     "create_backend",

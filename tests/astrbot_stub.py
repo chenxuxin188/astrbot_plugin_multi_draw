@@ -41,6 +41,16 @@ class Image:
         obj.data = data
         return obj
 
+    async def convert_to_base64(self) -> str:
+        import base64
+
+        return base64.b64encode(self.data).decode()
+
+
+class Reply:
+    def __init__(self, chain=None):
+        self.chain = chain or []
+
 
 class Plain:
     def __init__(self, text):
@@ -54,6 +64,7 @@ class AstrMessageEvent:
         self.platform = platform
         self.unified_msg_origin = f"{platform}:GroupMessage:{group}"
         self.sent: list = []
+        self.messages: list = []  # 用户这条消息里的组件（图片修改测试用）
         self._extra = {}
 
     def get_sender_id(self):
@@ -67,6 +78,9 @@ class AstrMessageEvent:
 
     def get_platform_name(self):
         return self.platform
+
+    def get_messages(self):
+        return self.messages
 
     def get_extra(self, key=None, default=None):
         return self._extra.get(key, default)
@@ -95,6 +109,11 @@ class _Group:
 
 
 class filter:  # noqa: N801
+    class EventMessageType:
+        ALL = "all"
+        GROUP_MESSAGE = "group"
+        PRIVATE_MESSAGE = "private"
+
     @staticmethod
     def llm_tool(name=None):
         return lambda fn: fn
@@ -102,6 +121,10 @@ class filter:  # noqa: N801
     @staticmethod
     def command_group(name):
         return lambda fn: _Group(fn)
+
+    @staticmethod
+    def event_message_type(kind, priority=0):
+        return lambda fn: fn
 
 
 class Star:
@@ -189,6 +212,7 @@ def install(data_dir: Path):
     comps = types.ModuleType("astrbot.api.message_components")
     comps.Image = Image
     comps.Plain = Plain
+    comps.Reply = Reply
     star = types.ModuleType("astrbot.api.star")
     star.Context = Context
     star.Star = Star

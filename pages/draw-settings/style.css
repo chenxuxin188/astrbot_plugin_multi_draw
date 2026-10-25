@@ -20,6 +20,8 @@
   --warn-soft: rgba(240, 160, 32, 0.14);
   --danger: #d03050;
   --danger-soft: rgba(208, 48, 80, 0.1);
+  --info: #0b7a85;
+  --info-soft: rgba(11, 122, 133, 0.1);
   --input-bg: #ffffff;
   --shadow: 0 1px 2px rgba(20, 24, 40, 0.04), 0 4px 16px rgba(20, 24, 40, 0.06);
   --shadow-lg: 0 8px 32px rgba(20, 24, 40, 0.18);
@@ -51,6 +53,8 @@
   --warn-soft: rgba(232, 176, 74, 0.16);
   --danger: #f2738c;
   --danger-soft: rgba(242, 115, 140, 0.14);
+  --info: #5cc6d0;
+  --info-soft: rgba(92, 198, 208, 0.14);
   --input-bg: #181920;
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 4px 16px rgba(0, 0, 0, 0.25);
   --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.5);
@@ -78,6 +82,8 @@
     --warn-soft: rgba(232, 176, 74, 0.16);
     --danger: #f2738c;
     --danger-soft: rgba(242, 115, 140, 0.14);
+    --info: #5cc6d0;
+    --info-soft: rgba(92, 198, 208, 0.14);
     --input-bg: #181920;
     --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 4px 16px rgba(0, 0, 0, 0.25);
     --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.5);
@@ -1463,6 +1469,416 @@ body.no-scroll {
   margin-top: 2px;
 }
 
+/* ------------------------------------------------------------ 能力徽标 / 小按钮 */
+
+.badge-feature {
+  background: var(--info-soft);
+  color: var(--info);
+  border-color: transparent;
+}
+
+.icon-btn-sm {
+  width: 28px;
+  height: 28px;
+}
+
+.icon-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* ------------------------------------------------------------ 余额 */
+
+.bk-toolbar {
+  margin-bottom: 12px;
+}
+
+.balance-box:not(:empty) {
+  margin-top: 10px;
+}
+
+.bal-reason {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-2);
+  word-break: break-word;
+}
+
+.bal-card {
+  margin-top: 8px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--card-2);
+  transition: opacity 0.15s;
+}
+
+.bal-card.is-stale {
+  opacity: 0.55;
+}
+
+.bal-title {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.bal-list {
+  margin: 0;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 4px 14px;
+  font-size: 13px;
+}
+
+.bal-row {
+  display: contents;
+}
+
+.bal-k {
+  color: var(--text-3);
+  white-space: nowrap;
+}
+
+.bal-v {
+  margin: 0;
+  font-weight: 600;
+  word-break: break-word;
+  font-variant-numeric: tabular-nums;
+}
+
+.bal-list.is-compact {
+  gap: 1px 10px;
+  font-size: 12.5px;
+}
+
+.bal-list.is-compact .bal-v {
+  font-weight: 500;
+}
+
+.bal-note {
+  margin: 6px 0 0;
+  font-size: 12px;
+  color: var(--text-3);
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+
+.bal-error {
+  color: var(--danger);
+  font-size: 12.5px;
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+
+.bal-all .card-head {
+  flex-wrap: nowrap;
+}
+
+.bal-table-wrap {
+  overflow-x: auto;
+}
+
+.bal-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.bal-table th,
+.bal-table td {
+  text-align: left;
+  vertical-align: top;
+  padding: 7px 10px 7px 0;
+  border-top: 1px solid var(--border);
+}
+
+.bal-table thead th {
+  border-top: 0;
+  padding-top: 0;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-3);
+}
+
+.bal-table tbody th {
+  width: 1%;
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+.bal-table td {
+  padding-right: 0;
+  min-width: 0;
+  word-break: break-word;
+}
+
+.bal-table .bal-name {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.bal-table tr.is-skipped .bal-name {
+  color: var(--text-2);
+}
+
+/* ------------------------------------------------------------ 试画：模式切换与图片修改 */
+
+.mode-row {
+  display: flex;
+  align-items: center;
+  gap: 6px 12px;
+  flex-wrap: wrap;
+}
+
+.seg {
+  display: inline-flex;
+  padding: 3px;
+  gap: 2px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--card-2);
+  flex: none;
+}
+
+.seg-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 0;
+  border-radius: 7px;
+  padding: 4px 14px;
+  min-height: 28px;
+  background: transparent;
+  color: var(--text-2);
+  cursor: pointer;
+  white-space: nowrap;
+  font-size: 13px;
+}
+
+.seg-btn:hover:not(:disabled) {
+  color: var(--text);
+}
+
+.seg-btn[aria-pressed="true"] {
+  background: var(--card);
+  color: var(--accent);
+  font-weight: 600;
+  box-shadow: 0 1px 3px rgba(20, 24, 40, 0.12);
+}
+
+.seg-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.mode-note {
+  margin: 0;
+  flex: 1 1 200px;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--text-3);
+  word-break: break-word;
+}
+
+.mode-note.is-warn {
+  color: var(--warn);
+}
+
+.drop-zone {
+  padding: 10px;
+  border-radius: var(--radius-sm);
+  border: 1.5px dashed var(--border-strong);
+  background: var(--card-2);
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.drop-zone.is-drag {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.edit-thumbs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.edit-thumb,
+.edit-add {
+  position: relative;
+  width: 88px;
+  height: 88px;
+  flex: none;
+  border-radius: 8px;
+}
+
+.edit-thumb {
+  overflow: hidden;
+  border: 1px solid var(--border);
+  background: var(--card);
+}
+
+.edit-thumb.is-busy {
+  display: grid;
+  place-items: center;
+}
+
+.edit-thumb-img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  cursor: zoom-in;
+}
+
+.edit-thumb-img img,
+.edit-orig img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  /* 透明背景的 PNG 显示成棋盘格 */
+  background: repeating-conic-gradient(rgba(128, 128, 128, 0.18) 0% 25%, transparent 0% 50%) 50% / 12px 12px;
+}
+
+.edit-thumb-no {
+  position: absolute;
+  left: 4px;
+  bottom: 4px;
+  padding: 0 5px;
+  border-radius: 4px;
+  font-size: 11px;
+  line-height: 17px;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.6);
+  pointer-events: none;
+}
+
+.edit-thumb-x {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.6);
+  cursor: pointer;
+}
+
+.edit-thumb-x:hover {
+  background: var(--danger);
+}
+
+.edit-thumb-x .icon {
+  width: 14px;
+  height: 14px;
+}
+
+.edit-add {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 6px;
+  border: 1px solid var(--border-strong);
+  background: var(--card);
+  color: var(--text-2);
+  cursor: pointer;
+  font-size: 12px;
+  text-align: center;
+}
+
+.edit-add:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.edit-add .icon {
+  width: 20px;
+  height: 20px;
+}
+
+.drop-zone.is-empty .edit-add {
+  width: 100%;
+  height: auto;
+  min-height: 92px;
+  border-style: solid;
+  font-size: 14px;
+}
+
+.edit-add-sub {
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+.strength-val {
+  flex: none;
+  min-width: 3.2em;
+  padding: 2px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--card-2);
+  font-family: var(--mono);
+  font-size: 13px;
+  text-align: center;
+}
+
+.test-result.is-edit {
+  grid-template-columns: minmax(0, 400px) minmax(0, 1fr);
+}
+
+.edit-compare {
+  display: grid;
+  grid-template-columns: 76px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+}
+
+.edit-col {
+  min-width: 0;
+}
+
+.edit-cap {
+  font-size: 12px;
+  color: var(--text-3);
+  margin-bottom: 4px;
+}
+
+.edit-origs {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 460px;
+  overflow-y: auto;
+}
+
+.edit-orig {
+  position: relative;
+  display: block;
+  width: 100%;
+  aspect-ratio: 1;
+  flex: none;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--card-2);
+  cursor: zoom-in;
+}
+
 /* ------------------------------------------------------------ 窄屏 */
 
 @media (max-width: 760px) {
@@ -1497,8 +1913,20 @@ body.no-scroll {
     text-overflow: ellipsis;
   }
 
-  .test-result {
+  .test-result,
+  .test-result.is-edit {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .edit-compare {
+    grid-template-columns: 60px minmax(0, 1fr);
+    gap: 8px;
+  }
+
+  .edit-thumb,
+  .edit-add {
+    width: 76px;
+    height: 76px;
   }
 
   .card {
@@ -1530,6 +1958,30 @@ body.no-scroll {
 
   .field-key {
     display: none;
+  }
+}
+
+/* 很窄时余额汇总改成上下排列：平台名一行，结果一行 */
+@media (max-width: 520px) {
+  .bal-table thead {
+    display: none;
+  }
+
+  .bal-table tr,
+  .bal-table tbody th,
+  .bal-table td {
+    display: block;
+    width: auto;
+  }
+
+  .bal-table tbody th {
+    padding: 8px 0 2px;
+    white-space: normal;
+  }
+
+  .bal-table td {
+    border-top: 0;
+    padding: 0 0 8px;
   }
 }
 

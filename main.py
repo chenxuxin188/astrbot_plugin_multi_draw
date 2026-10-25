@@ -4,6 +4,7 @@ import os
 import re
 import time
 import uuid
+from collections import OrderedDict
 from datetime import datetime
 
 from astrbot.api import AstrBotConfig, logger
@@ -12,8 +13,29 @@ from astrbot.api.message_components import Image
 from astrbot.api.star import Context, Star, StarTools
 
 from .audit import AuditLog, format_record
-from .backends import BACKEND_ORDER, BACKENDS, backend_missing, backend_summary, create_backend, resolve_key
-from .backends.base import Backend, Clients, DrawRequest, DrawResult, HttpPool, as_bool, as_float, as_int, as_str
+from .backends import (
+    BACKEND_ORDER,
+    BACKENDS,
+    backend_balance_missing,
+    backend_edit_missing,
+    backend_missing,
+    backend_summary,
+    create_backend,
+    resolve_key,
+)
+from .backends.base import (
+    Backend,
+    Clients,
+    DrawRequest,
+    DrawResult,
+    HttpPool,
+    InputImage,
+    as_bool,
+    as_float,
+    as_int,
+    as_str,
+    image_orientation,
+)
 from .backends.novelai import (
     NovelAIBackend,
     NovelAIClient,
@@ -25,14 +47,27 @@ from .backends.novelai import (
     mask_url_credentials,
     tier_name,
 )
+from .backends.novelai import (
+    balance_info as novelai_balance_info,
+)
+from .event_images import (
+    ImageCollector,
+    collect_event_images,
+    count_image_parts,
+    load_ref_groups,
+    message_image_refs,
+)
 from .gallery import Gallery
-from .imaging import to_jpeg
+from .imaging import normalize_input, to_jpeg
 from .limiter import Limiter
 from .prompting import (
     FALLBACK_LINES,
+    build_edit_system_prompt,
+    build_edit_user_prompt,
     build_natural_system_prompt,
     build_persona_system_prompt,
     build_persona_user_prompt,
+    build_tag_edit_system_prompt,
     build_tag_retry_prompt,
     build_tag_system_prompt,
     build_tag_user_prompt,
@@ -43,6 +78,7 @@ from .prompting import (
     join_tags,
     normalize_orientation,
     parse_natural_output,
+    parse_strength,
     parse_tag_output,
     strip_think,
 )
@@ -58,6 +94,13 @@ MAX_DESCRIPTION_CHARS = 1000
 ANLAS_SETTLE_SECONDS = 1.5
 # 看图评价时发给 LLM 的图片长边上限：足够看清画面，又不会让请求过大
 EVAL_IMAGE_MAX_EDGE = 1024
+# 用户说「把刚才那张图改一下」时，可以修改本会话中多久以内画的图
+LAST_IMAGE_TTL = 2 * 3600
+LAST_IMAGE_SESSIONS = 100
+IMAGE_FETCH_TIMEOUT = 30
+# 用户先发图片、再单独发文字要求修改时，可以修改多久以内发的图（只记地址，不下载）
+USER_IMAGE_TTL = 30 * 60
+USER_IMAGE_ENTRIES = 500
 # 这些平台在流水线结束后会关闭回复通道，后台任务发出的消息会被丢弃，需要等绘图完成
 INLINE_PLATFORMS = ("webchat", "wecom_ai_bot")
 # 等不到绘图完成时给事件打上的标记（值为当时的 monotonic 时间）：之后的消息改为通过 context.send_message 主动发送
@@ -104,6 +147,10 @@ class MultiDrawPlugin(Star):
         self.eval_dir = data_dir / "eval"
         self.config_lock = asyncio.Lock()
         self._limiters: dict[str, Limiter] = {}
+        # 每个会话最近画好的一张图：用户没有发图时，修改图片默认修改这张
+        self._last_images: OrderedDict[str, tuple[InputImage, float]] = OrderedDict()
+        # 每个会话中每个用户最近发送的图片地址
+        self._user_images: OrderedDict[tuple[str, str], tuple[list[list[str]], float]] = OrderedDict()
         self._inflight: set[str] = set()
         self._tasks: set[asyncio.Task] = set()
         self._closing = False
@@ -137,6 +184,11 @@ class MultiDrawPlugin(Star):
     def backend(self, key: str | None = None) -> Backend:
         key = key or self.backend_key()
         return create_backend(key, self.section(key))
+
+    def edit_backend(self) -> Backend:
+        """修改图片使用的平台：配置了「修改图片使用的平台」时用它，否则与绘图相同。"""
+        key = as_str(self.section("draw").get("edit_backend"))
+        return self.backend(key if key in BACKENDS else None)
 
     async def save_config(self) -> None:
         """保存插件配置（不会触发插件重载）。调用方需持有 config_lock。"""
@@ -179,6 +231,42 @@ class MultiDrawPlugin(Star):
                 event.set_extra(DETACHED_KEY, time.monotonic())
         return None
 
+    async def _prefetch_images(self, event: AstrMessageEvent) -> tuple[list[bytes], int]:
+        """读取要修改的图片，返回 (图片数据, 看到的图片数)。
+
+        依次读取本条消息、引用的消息中的图片；都没有时读取该用户最近单独发送的图片。
+        读取超时或出错时保留已经读到的图片；消息中有图片时看到的图片数至少为 1，以免改错图片。
+        """
+        collector = None
+        try:
+            client = await self.http.get("")
+            collector = ImageCollector(client, max(1, self.edit_backend().max_edit_images))
+            await asyncio.wait_for(self._collect_images(event, collector), IMAGE_FETCH_TIMEOUT)
+            return collector.results, collector.seen
+        except asyncio.TimeoutError:
+            logger.warning(f"{LOG_PREFIX} 读取消息中的图片超时")
+        except Exception as e:
+            logger.warning(f"{LOG_PREFIX} 读取消息中的图片失败：{_err_text(e)}")
+        results = collector.results if collector else []
+        seen = collector.seen if collector else 0
+        if not seen and count_image_parts(event):
+            seen = 1
+        return results, seen
+
+    async def _collect_images(self, event: AstrMessageEvent, collector: ImageCollector) -> None:
+        await collect_event_images(event, self.context, collector)
+        if collector.results or collector.seen:
+            return
+        # 本条消息中没有图片：用户可能先发了图片，再单独发文字要求修改
+        umo = event.unified_msg_origin
+        cached = self._user_images.get((umo, str(event.get_sender_id())))
+        if not cached or time.monotonic() - cached[1] > USER_IMAGE_TTL:
+            return
+        drawn = self._last_images.get(umo)
+        if drawn and drawn[1] > cached[1]:
+            return  # 机器人在那之后又画了图：修改最新画的图
+        await load_ref_groups(collector, cached[0], "之前发送的消息")
+
     def _inline_wait_seconds(self, event: AstrMessageEvent) -> float:
         """AstrBot 的工具调用超时减去余量。4.28 起在 agent_runner 设置中，之前在 provider_settings 中。"""
         try:
@@ -194,6 +282,46 @@ class MultiDrawPlugin(Star):
                 timeout = as_float(value, 0.0)
                 break
         return max(5.0, (timeout or 60.0) - 10.0)
+
+    @filter.llm_tool(name="edit_image")
+    async def edit_image_tool(self, event: AstrMessageEvent, instruction: str = "", orientation: str = "",
+                              **kwargs):
+        """修改图片并直接发送给用户。当用户发来图片（或引用了一张图片）并要求修改、换背景、换衣服、换画风、加减元素、重绘时调用；用户说「把刚才那张图改一下」这类话时也调用，会修改你上一张画的图。插件会自动用你的口吻发送开工提示、修改后的图片和评价，所以调用此工具时不要再输出任何回复文字。
+
+        Args:
+            instruction(string): 要怎么修改，用自然语言完整描述用户的要求：改什么、哪些地方保持不变
+            orientation(string): 可选，只有用户要求改变画面方向时才填写：portrait（竖图）、landscape（横图）或 square（方图），否则留空以保持原图比例
+        """
+        started = time.monotonic()
+        # 必须现在就读取图片：AstrBot 4.26-4.28 会在本轮事件结束后删除图片的临时文件，QQ 图片链接也会过期
+        prefetched = await self._prefetch_images(event)
+        task = self._spawn(self._draw_flow(event, str(instruction or ""), str(orientation or ""), "llm",
+                                           edit=True, prefetched=prefetched))
+        if task is not None and event.get_platform_name() in INLINE_PLATFORMS:
+            wait = max(1.0, self._inline_wait_seconds(event) - (time.monotonic() - started))
+            try:
+                done, _ = await asyncio.wait({task}, timeout=wait)
+            except asyncio.CancelledError:
+                event.set_extra(DETACHED_KEY, time.monotonic())
+                raise
+            if not done:
+                event.set_extra(DETACHED_KEY, time.monotonic())
+        return None
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def remember_user_images(self, event: AstrMessageEvent):
+        """记下用户最近发送的图片地址（不下载），用户之后单独发文字要求修改时使用。"""
+        try:
+            groups = message_image_refs(event)
+        except Exception:
+            return
+        if not groups:
+            return
+        key = (event.unified_msg_origin, str(event.get_sender_id()))
+        self._user_images[key] = (groups, time.monotonic())
+        self._user_images.move_to_end(key)
+        while len(self._user_images) > USER_IMAGE_ENTRIES:
+            self._user_images.popitem(last=False)
 
     @filter.command_group("draw")
     def draw(self):
@@ -258,6 +386,42 @@ class MultiDrawPlugin(Star):
             return
         yield event.plain_result(self._format_account(data, backend)).use_t2i(False)
 
+    @draw.command("balance")
+    async def draw_balance(self, event: AstrMessageEvent, name: str = ""):
+        """查询绘图平台的余额（管理员）：/draw balance [平台]，不填平台时查询所有已配置的平台"""
+        if not self._is_admin(event):
+            yield event.plain_result("权限不足：仅插件配置中的管理员可以使用该指令。")
+            return
+        if name:
+            key = resolve_key(name)
+            if not key:
+                yield event.plain_result(f"请指定平台：{'、'.join(BACKEND_ORDER)}，例如 /draw balance openai")
+                return
+            keys = [key]
+        else:
+            keys = [k for k in BACKEND_ORDER if not backend_missing(self.backend(k))]
+            if not keys:
+                yield event.plain_result("还没有配置任何绘图平台。")
+                return
+        results = await asyncio.gather(*(self.query_balance(self.backend(k)) for k in keys))
+        lines = ["绘图平台余额"]
+        for key, text in zip(keys, results, strict=True):
+            lines.append(f"【{BACKENDS[key].label}】{text}")
+        yield event.plain_result("\n".join(lines)).use_t2i(False)
+
+    async def query_balance(self, backend: Backend) -> str:
+        """查询一个平台的余额，返回一段可直接展示的文字。"""
+        reason = backend_balance_missing(backend)
+        if reason:
+            return reason
+        try:
+            info = await backend.balance(self.clients)
+        except Exception as e:
+            logger.warning(f"{LOG_PREFIX} 查询 {backend.label} 余额失败：{_err_text(e)}")
+            return f"查询失败：{_err_text(e)}"
+        text = "；".join(f"{k}：{v}" for k, v in info.items) or "没有返回余额信息"
+        return f"{text}（{info.note}）" if info.note else text
+
     @draw.command("audit")
     async def draw_audit(self, event: AstrMessageEvent, page: int = 1):
         """查看绘图记录（管理员）：/draw audit [页码]"""
@@ -319,28 +483,77 @@ class MultiDrawPlugin(Star):
     def _queued_ahead(self, backend: Backend) -> int:
         return self._limiter(backend.key).queued_ahead()
 
-    async def _draw_flow(self, event: AstrMessageEvent, description: str, orientation: str, source: str):
+    async def _draw_flow(self, event: AstrMessageEvent, description: str, orientation: str, source: str,
+                         edit: bool = False, prefetched: tuple[list[bytes], int] | None = None):
         description = description.strip()[:MAX_DESCRIPTION_CHARS]
         if not description:
-            await self._send_text(event, "想让我画什么呢？把想画的内容告诉我吧～")
+            ask = "想把图片改成什么样呢？把修改要求告诉我吧～" if edit else "想让我画什么呢？把想画的内容告诉我吧～"
+            await self._send_text(event, ask)
             return
-        backend = self.backend()
-        missing = backend_missing(backend)
+        backend = self.edit_backend() if edit else self.backend()
+        missing = backend_missing(backend, edit=edit)
         if missing:
             await self._send_text(event, f"{missing}，暂时没法画画哦。")
             return
+        images: list[InputImage] = []
+        if edit:
+            reason = backend_edit_missing(backend)
+            if reason:
+                await self._send_text(event, f"{reason}，没法修改图片哦。管理员可以在「修改图片使用的平台」中换一个支持的平台。")
+                return
+            images, seen = await self._edit_inputs(event, backend.max_edit_images, prefetched)
+            if not images:
+                await self._send_text(event, "消息里的图片读取失败了（QQ 的图片链接可能已经过期），请重新发送图片再试一次～" if seen
+                                      else "没有找到要修改的图片～请把图片和修改要求一起发给我，或者引用那张图片再说要怎么改。")
+                return
         uid = str(event.get_sender_id())
         if uid in self._inflight:
             await self._send_text(event, "你的上一张画还没完成，请稍等一下～")
             return
         self._inflight.add(uid)
         try:
-            await self._draw(event, description, orientation, source, backend)
+            await self._draw(event, description, orientation, source, backend, images)
         finally:
             self._inflight.discard(uid)
 
+    async def _edit_inputs(self, event: AstrMessageEvent, limit: int,
+                           prefetched: tuple[list[bytes], int] | None) -> tuple[list[InputImage], int]:
+        """修改图片的输入：本条消息或引用的消息中的图片；消息中没有图片时使用本会话最近画的一张图。
+
+        返回 (图片, 消息中看到的图片数)。消息中有图片却读不出来时不改用最近的图，以免改错图片。
+        """
+        raw, seen = prefetched or ([], 0)
+        images = []
+        for data in raw:
+            normalized = await asyncio.to_thread(normalize_input, data)
+            if normalized is None:
+                logger.warning(f"{LOG_PREFIX} 跳过无法识别的图片（{len(data)} 字节）")
+                continue
+            images.append(InputImage(*normalized))
+        if images:
+            if len(images) > limit:
+                logger.info(f"{LOG_PREFIX} 消息中有 {len(images)} 张图片，只使用前 {limit} 张")
+            return images[:limit], seen
+        if seen:
+            return [], seen
+        cached = self._last_images.get(event.unified_msg_origin)
+        if cached and time.monotonic() - cached[1] < LAST_IMAGE_TTL:
+            return [cached[0]], 0
+        return [], 0
+
+    async def _remember_image(self, event: AstrMessageEvent, result: DrawResult) -> None:
+        normalized = await asyncio.to_thread(normalize_input, result.image)
+        if normalized is None:
+            return
+        umo = event.unified_msg_origin
+        self._last_images[umo] = (InputImage(*normalized), time.monotonic())
+        self._last_images.move_to_end(umo)
+        while len(self._last_images) > LAST_IMAGE_SESSIONS:
+            self._last_images.popitem(last=False)
+
     async def _draw(self, event: AstrMessageEvent, description: str, orientation: str, source: str,
-                    backend: Backend):
+                    backend: Backend, images: list[InputImage] | None = None):
+        images = images or []
         started = time.monotonic()
         record = {
             "time": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -354,8 +567,12 @@ class MultiDrawPlugin(Star):
             "request": description,
             "status": "failed",
         }
+        if images:
+            record.update(mode="edit", input_images=len(images))
         with contextlib.suppress(Exception):
             record["model"] = backend.model  # 生成前就失败（如 LLM 不可用）时记录中也有模型
+        # 人格台词中的需求描述：修改图片时说明是在改对方的图
+        persona_desc = f"修改对方发来的图片：{description}" if images else description
         stage = "prompt"
         persona = ""
         prompt_task = None
@@ -364,16 +581,17 @@ class MultiDrawPlugin(Star):
         try:
             persona = await self._persona_prompt(event)
             prompt_task = _quiet(asyncio.create_task(
-                self._make_prompt(event, description, orientation, backend.prompt_mode)
+                self._make_prompt(event, description, orientation,
+                                  backend.edit_prompt_mode if images else backend.prompt_mode, images)
             ))
-            start_line = await self._persona_line(event, persona, "start", description=description)
+            start_line = await self._persona_line(event, persona, "start", description=persona_desc)
             queued = self._queued_ahead(backend)
             if queued:
                 start_line += f"\n（前面还有 {queued} 张在排队）"
             await self._send_text(event, start_line)
 
             generated = await prompt_task
-            req = self._build_request(backend, generated, orientation)
+            req = self._build_request(backend, generated, orientation, images)
             logger.info(f"{LOG_PREFIX} 发送给 {backend.label} 的 prompt：{req.prompt}")
             if req.negative:
                 logger.info(f"{LOG_PREFIX} 发送给 {backend.label} 的负面 prompt：{req.negative}")
@@ -399,11 +617,12 @@ class MultiDrawPlugin(Star):
             record.update(stage=stage, error=error[:500])
             logger.warning(f"{LOG_PREFIX} 绘图失败（{backend.label}，{stage}）：{error}")
             await self._send_text(event, f"绘图失败：{error}")
-            line = await self._persona_line(event, persona, "fail", description=description, error=error)
+            line = await self._persona_line(event, persona, "fail", description=persona_desc, error=error)
             await self._send_text(event, line)
         else:
+            await self._remember_image(event, result)
             comment = await self._persona_line(
-                event, persona, "success", image=result, description=description, prompt=req.prompt
+                event, persona, "success", image=result, description=persona_desc, prompt=req.prompt
             )
             await self._send_text(event, comment)
         finally:
@@ -412,16 +631,22 @@ class MultiDrawPlugin(Star):
             record["duration"] = round(time.monotonic() - started, 1)
             await self._save_record(record)
 
-    def _build_request(self, backend: Backend, generated: dict, orientation: str) -> DrawRequest:
-        orient = (
-            normalize_orientation(orientation)
-            or generated["orientation"]
-            or normalize_orientation(self.section("draw").get("default_orientation"))
-            or "portrait"
-        )
+    def _build_request(self, backend: Backend, generated: dict, orientation: str,
+                       images: list[InputImage] | None = None) -> DrawRequest:
+        images = images or []
+        explicit = normalize_orientation(orientation)
+        default = normalize_orientation(self.section("draw").get("default_orientation"))
+        if images:
+            # 修改图片时保持原图的方向；只有用户要求时（edit_image 的 orientation 参数）才改变
+            orient = explicit or image_orientation(images[0]) or generated["orientation"] or default or "portrait"
+        else:
+            orient = explicit or generated["orientation"] or default or "portrait"
+        mode = backend.edit_prompt_mode if images else backend.prompt_mode
         positive = as_str(backend.section.get("required_positive"))
         negative = as_str(backend.section.get("required_negative"))
-        if backend.prompt_mode == "tags":
+        if images and mode != "tags":
+            positive = negative = ""  # 自然语言修改指令后面不追加质量标签
+        if mode == "tags":
             # LLM 生成的标签已在 _make_prompt 中过滤，这里只过滤配置里填写的必定包含的提示词
             positive, dropped = drop_non_english_tags(positive)
             negative, dropped_negative = drop_non_english_tags(negative)
@@ -429,11 +654,16 @@ class MultiDrawPlugin(Star):
                 logger.warning(f"{LOG_PREFIX} 配置的提示词中含非英文标签，已忽略：{dropped + dropped_negative}")
         if isinstance(backend, NovelAIBackend) and is_v5_model(backend.model) and backend.free_guard:
             logger.warning(f"{LOG_PREFIX} {backend.model} 是 V5 模型，不受免费参数保护：会消耗 Opus 用量条，用尽后扣 Anlas")
+        strength = 0.0
+        if images and backend.supports_strength:
+            strength = generated.get("strength") or as_float(self.section("draw").get("edit_strength"), 0.6, 0.05, 0.99)
         return DrawRequest(
             # 质量词按官方做法追加在末尾，必须的负面词放在最前
             prompt=join_tags(generated["prompt"], positive),
             negative=join_tags(negative, generated["negative"]),
             orientation=orient,
+            images=images,
+            strength=strength,
         )
 
     async def _generate(self, backend: Backend, req: DrawRequest, record: dict,
@@ -588,24 +818,57 @@ class MultiDrawPlugin(Star):
             return "image" in modalities
         return None
 
-    async def _make_prompt(self, event: AstrMessageEvent, description: str, orientation: str, mode: str) -> dict:
-        """用 LLM 把绘图需求转换成提示词：tags 模式生成英文标签，natural 模式生成自然语言描述。"""
+    async def _prompt_llm(self, event: AstrMessageEvent, provider_id: str, system_prompt: str, description: str,
+                          orientation: str, images: list[InputImage]) -> str:
+        """生成提示词。修改图片时尽量把原图一起发给 LLM（需要支持图片输入），失败时只发文字。"""
+        if not images:
+            return await self._llm(event, provider_id, system_prompt, build_tag_user_prompt(description, orientation),
+                                   PROMPT_LLM_TIMEOUT)
+        paths = []
+        try:
+            for image in images:
+                paths.append(await asyncio.to_thread(self._write_eval_image, DrawResult(image.data, image.mime)))
+            return await self._llm(
+                event, provider_id, system_prompt,
+                build_edit_user_prompt(description, orientation, len(images), True), PROMPT_LLM_TIMEOUT,
+                image_urls=paths,
+            )
+        except Exception as e:
+            logger.info(f"{LOG_PREFIX} 带原图生成修改提示词失败，改为只发文字：{_err_text(e)}")
+        finally:
+            for path in paths:
+                with contextlib.suppress(OSError):
+                    os.remove(path)
+        return await self._llm(event, provider_id, system_prompt,
+                               build_edit_user_prompt(description, orientation, len(images), False), PROMPT_LLM_TIMEOUT)
+
+    async def _make_prompt(self, event: AstrMessageEvent, description: str, orientation: str, mode: str,
+                           images: list[InputImage] | None = None) -> dict:
+        """用 LLM 把绘图需求转换成提示词：tags 模式生成英文标签，natural 模式生成自然语言描述；
+        修改图片时 natural 模式生成修改指令，tags 模式生成结果图的标签和重绘幅度。"""
+        images = images or []
         pc = self.section("prompt")
         sfw = as_bool(pc.get("sfw_only"), True)
         extra = as_str(pc.get("extra_instruction"))
         provider_id = as_str(pc.get("provider_id"))
         orientation = normalize_orientation(orientation)
-        user_prompt = build_tag_user_prompt(description, orientation)
         if mode != "tags":
-            system_prompt = build_natural_system_prompt(as_str(pc.get("natural_system_prompt")), sfw=sfw, extra=extra)
-            raw = await self._llm(event, provider_id, system_prompt, user_prompt, PROMPT_LLM_TIMEOUT)
+            if images:
+                system_prompt = build_edit_system_prompt(as_str(pc.get("edit_system_prompt")), sfw=sfw, extra=extra)
+            else:
+                system_prompt = build_natural_system_prompt(as_str(pc.get("natural_system_prompt")), sfw=sfw,
+                                                            extra=extra)
+            raw = await self._prompt_llm(event, provider_id, system_prompt, description, orientation, images)
             result = parse_natural_output(raw)
             if not result["prompt"]:
                 raise RuntimeError("LLM 没有生成有效的绘图提示词")
+            result["strength"] = parse_strength(raw)
             return result
 
-        system_prompt = build_tag_system_prompt(as_str(pc.get("tag_system_prompt")), sfw=sfw, extra=extra)
-        raw = await self._llm(event, provider_id, system_prompt, user_prompt, PROMPT_LLM_TIMEOUT)
+        build = build_tag_edit_system_prompt if images else build_tag_system_prompt
+        system_prompt = build(as_str(pc.get("tag_system_prompt")), sfw=sfw, extra=extra)
+        raw = await self._prompt_llm(event, provider_id, system_prompt, description, orientation, images)
+        strength = parse_strength(raw)
         tags = parse_tag_output(raw)
         # 标签模式的绘图模型只理解英文：结果里混有中日韩文字时让 LLM 重写一次
         if contains_non_english(tags["prompt"]) or contains_non_english(tags["negative"]):
@@ -630,6 +893,7 @@ class MultiDrawPlugin(Star):
             logger.warning(f"{LOG_PREFIX} 已去掉无法使用的非英文标签：{dropped + dropped_negative}")
         if not tags["prompt"]:
             raise RuntimeError("LLM 没有生成有效的英文绘图提示词")
+        tags["strength"] = strength
         return tags
 
     async def _persona_line(self, event: AstrMessageEvent, persona: str, kind: str,
@@ -788,9 +1052,7 @@ class MultiDrawPlugin(Star):
                 steps.get("purchasedTrainingSteps", "未知"),
             ),
         ]
-        usage = data.get("usage")
-        if isinstance(usage, dict) and usage.get("percent") is not None:
-            lines.append(f"V5 用量条：{usage.get('percent')}%")
+        lines += [f"{label}：{value}" for label, value in novelai_balance_info(data).items if label == "V5 用量条"]
 
         orient = normalize_orientation(self.section("draw").get("default_orientation")) or "portrait"
         width, height = backend.size(orient)

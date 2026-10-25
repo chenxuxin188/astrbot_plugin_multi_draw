@@ -36,6 +36,43 @@
         ],
         "hint": "Bot 画画时使用的平台。各平台的 Key、模型、尺寸在下面对应的设置中填写，也可以在插件的「绘图设置」页面中配置和试画。管理员也可以用 /draw use <平台> 切换。"
       },
+      "edit_backend": {
+        "description": "修改图片使用的平台",
+        "type": "string",
+        "default": "",
+        "options": [
+          "",
+          "novelai",
+          "openai",
+          "seedream",
+          "xai",
+          "gemini",
+          "sensenova",
+          "comfyui"
+        ],
+        "labels": [
+          "与绘图相同",
+          "NovelAI",
+          "OpenAI（GPT Image）",
+          "Seedream（火山方舟 / 豆包）",
+          "xAI（Grok Imagine）",
+          "Gemini（Nano Banana）",
+          "SenseNova（商汤日日新）",
+          "ComfyUI（本地 / 自部署）"
+        ],
+        "hint": "Bot 修改用户发来的图片（换背景、换衣服、改画风等）时使用的平台。留空则与绘图使用同一个平台。七个平台都支持修改图片，但部分模型不支持（如 DALL·E、grok-2-image、NovelAI 的 inpainting 模型），各平台模型的支持情况见对应的配置说明。"
+      },
+      "edit_strength": {
+        "description": "图生图默认重绘幅度",
+        "type": "float",
+        "default": 0.6,
+        "slider": {
+          "min": 0.05,
+          "max": 0.99,
+          "step": 0.05
+        },
+        "hint": "NovelAI、ComfyUI 等通过图生图修改图片时，画面变化的程度：越小越接近原图，越大改动越多。LLM 会按修改要求自动调整，这里是它没有给出时的默认值。"
+      },
       "default_orientation": {
         "description": "默认画面方向",
         "type": "string",
@@ -92,7 +129,7 @@
         "type": "string",
         "default": "",
         "secret": true,
-        "hint": "在 NovelAI 网页 Account Settings → Get Persistent API Token 获取，以 pst- 开头。"
+        "hint": "在 NovelAI 网页 Account Settings → Get Persistent API Token 获取，以 pst- 开头。同一个 Token 也用于查询订阅、Anlas 余额和 V5 用量条（/draw balance、/draw account），不需要另外的密钥。"
       },
       "base_url": {
         "description": "API 地址",
@@ -130,7 +167,7 @@
           "NAI Diffusion V5 Full（消耗 Opus 用量条）",
           "NAI Diffusion V5 Curated（消耗 Opus 用量条）"
         ],
-        "hint": "Opus 会员使用 V4.5 及以下模型、单张、总像素 ≤ 1024×1024、步数 ≤ 28 时不消耗 Anlas。V5 会消耗 Opus 用量条，用尽后扣 Anlas。"
+        "hint": "Opus 会员使用 V4.5 及以下模型、单张、总像素 ≤ 1024×1024、步数 ≤ 28 时不消耗 Anlas。V5 会消耗 Opus 用量条，用尽后扣 Anlas。列表中的模型都支持修改图片（图生图，只使用一张原图，输出尺寸按原图比例）；名称以 -inpainting 结尾的局部重绘专用模型不支持。官方说明有底图的生成不在 Opus 免费范围内，修改图片可能消耗 Anlas。"
       },
       "portrait_size": {
         "description": "竖图尺寸",
@@ -197,7 +234,18 @@
         "description": "强制使用免费参数",
         "type": "bool",
         "default": true,
-        "hint": "开启后自动把尺寸缩小到总像素 ≤ 1024×1024、步数限制在 28 以内。Opus 会员使用 V4.5 及以下模型时不消耗 Anlas；V5 模型不受此开关保护，仍会消耗 Opus 用量条，用尽后扣 Anlas。"
+        "hint": "开启后自动把尺寸缩小到总像素 ≤ 1024×1024、步数限制在 28 以内。Opus 会员使用 V4.5 及以下模型时不消耗 Anlas；V5 模型不受此开关保护，仍会消耗 Opus 用量条，用尽后扣 Anlas。修改图片时输出尺寸按原图比例，像素数不超过对应方向配置的尺寸（开启时同样 ≤ 1024×1024；关闭时最多为官方上限 3145728 像素），但图生图可能不在免费范围内。"
+      },
+      "edit_noise": {
+        "description": "修改图片的噪声（noise）",
+        "type": "float",
+        "default": 0.0,
+        "slider": {
+          "min": 0.0,
+          "max": 0.99,
+          "step": 0.01
+        },
+        "hint": "修改图片（图生图）时额外加入的噪声，范围 0-0.99，官方默认 0。适当调高可以生成更多新细节，过高会出现奇怪的瑕疵。画面改动的程度（重绘幅度 strength）在「通用绘图设置 → 图生图默认重绘幅度」中设置，LLM 也会按修改要求自动调整。"
       },
       "timeout": {
         "description": "生成超时（秒）",
@@ -246,7 +294,7 @@
         "description": "绘图模型",
         "type": "string",
         "default": "gpt-image-2.5-flare",
-        "hint": "推荐 gpt-image-2.5-flare（速度最快，适合日常出图）或 gpt-image-2.5-sunburst（质量最高，更慢更贵）；gpt-image-2 仍可使用。gpt-image-1.5、gpt-image-1-mini、chatgpt-image-latest 将于 2026-12-01 下线，gpt-image-1 和 DALL·E 2 / 3 已下线。使用中转服务时可以填写它提供的任意模型名，也可以点「获取模型列表」选择。"
+        "hint": "推荐 gpt-image-2.5-flare（速度最快，适合日常出图）或 gpt-image-2.5-sunburst（质量最高，更慢更贵）；gpt-image-2 仍可使用。gpt-image-1.5、gpt-image-1-mini、chatgpt-image-latest 将于 2026-12-01 下线，gpt-image-1 和 DALL·E 2 / 3 已下线。修改图片：所有 GPT Image 模型都支持（一次最多 16 张图，可在下面单独设置修改图片使用的模型），DALL·E 不支持；中转服务需要支持 /images/edits 接口（one-api 不支持）。使用中转服务时可以填写它提供的任意模型名，也可以点「获取模型列表」选择。"
       },
       "portrait_size": {
         "description": "竖图尺寸",
@@ -330,7 +378,7 @@
           "标准",
           "宽松（low）"
         ],
-        "hint": "仅 GPT Image 模型使用。low 的过滤更少，但仍须遵守 OpenAI 的使用政策；被拦截时会提示换一种描述。"
+        "hint": "仅 GPT Image 模型使用。low 的过滤更少，但仍须遵守 OpenAI 的使用政策；被拦截时会提示换一种描述。修改图片时同样发送；如果提示图片修改接口不接受该参数，请改回标准。"
       },
       "response_format": {
         "description": "返回格式（中转服务）",
@@ -350,11 +398,33 @@
         ],
         "hint": "只对非 GPT Image 模型（中转服务上的 dall-e-3、flux 等）生效；GPT Image 模型始终不发送此参数。自动 = dall-e-3 / dall-e-2 发送 b64_json，其他模型不发送（中转服务可能把改名的 GPT Image 模型转发给 OpenAI，带上此参数会报 unknown parameter: response_format）。返回 b64_json 或图片链接都能识别。"
       },
+      "edit_model": {
+        "description": "修改图片使用的模型",
+        "type": "string",
+        "default": "",
+        "hint": "留空则与绘图模型相同。修改图片推荐 gpt-image-2.5-sunburst（官方称其编辑精度最高），追求速度可用 gpt-image-2.5-flare；所有 GPT Image 模型都支持修改图片（一次最多 16 张图），DALL·E 不支持。使用中转服务时填写它支持 /images/edits 接口的模型名。"
+      },
+      "edit_size": {
+        "description": "修改图片的尺寸",
+        "type": "string",
+        "default": "match",
+        "options": [
+          "match",
+          "orientation",
+          "auto"
+        ],
+        "labels": [
+          "保持原图比例（推荐）",
+          "使用竖图 / 横图 / 方图尺寸",
+          "自动（由模型决定）"
+        ],
+        "hint": "保持原图比例：gpt-image-2 / 2.5 按第一张图的宽高比出图，像素数与对应方向的尺寸设置相同；用户要求换方向时使用该方向的尺寸。其他 GPT Image 模型只有三种标准尺寸，使用最接近的一种；中转服务上的其他模型不发送尺寸。"
+      },
       "timeout": {
         "description": "生成超时（秒）",
         "type": "int",
         "default": 300,
-        "hint": "单次生成的超时时间，范围 10-1800。官方说明复杂提示词可能需要 2 分钟，高分辨率或高质量会更久。超时后不会自动重试，避免重复扣费。"
+        "hint": "单次生成或修改图片的超时时间，范围 10-1800。官方说明复杂提示词可能需要 2 分钟，高分辨率或高质量会更久。超时后不会自动重试，避免重复扣费。"
       },
       "extra_body": {
         "description": "额外请求参数",
@@ -362,7 +432,32 @@
         "default": "",
         "editor_mode": true,
         "editor_language": "json",
-        "hint": "JSON 对象，最后合并到请求体中，可以覆盖上面的任何参数；值为 null 表示删除该字段。例如 {\"output_format\": \"jpeg\", \"output_compression\": 80}。留空则不添加。"
+        "hint": "JSON 对象，最后合并到请求体中，可以覆盖上面的任何参数；值为 null 表示删除该字段。例如 {\"output_format\": \"jpeg\", \"output_compression\": 80}。修改图片时同样合并（以表单字段发送，对象和数组会被忽略）。留空则不添加。"
+      },
+      "balance_mode": {
+        "description": "余额查询方式",
+        "type": "string",
+        "default": "auto",
+        "options": [
+          "auto",
+          "relay",
+          "admin",
+          "off"
+        ],
+        "labels": [
+          "自动",
+          "中转服务额度接口",
+          "官方管理密钥（本月消费）",
+          "关闭"
+        ],
+        "hint": "OpenAI 官方没有查询剩余额度的接口。自动：API 地址是官方地址时，用下面的管理密钥查询本月已花费的金额（没填则提示到官网查看）；是中转服务时，用绘图的 API Key 查询中转服务的剩余额度（one-api / new-api 等常见中转服务提供的 /v1/dashboard/billing 接口，非官方）。官方管理密钥：始终向 api.openai.com 查询本月消费，适合通过反向代理访问官方 API 的情况。"
+      },
+      "balance_key": {
+        "description": "管理密钥（仅用于查询消费）",
+        "type": "string",
+        "default": "",
+        "secret": true,
+        "hint": "可选，OpenAI Admin API Key（sk-admin- 开头），只用于在官方 API 上查询本月已花费的金额和消费上限，不能用于绘图，也只会通过 https 发送给 OpenAI 官方地址（api.openai.com 或 eu.api.openai.com 等区域地址），不会发送给中转服务。需要组织 Owner 在 platform.openai.com → Settings → Organization → Admin keys 创建；管理密钥权限很大，如果创建时可以选择只读（Read only）权限请选只读，并妥善保管。使用中转服务时不需要填写。"
       }
     }
   },
@@ -393,7 +488,7 @@
         "description": "绘图模型",
         "type": "string",
         "default": "doubao-seedream-5-0-pro-260628",
-        "hint": "模型 ID 或推理接入点 ID（ep-...）。火山方舟：doubao-seedream-5-0-pro-260628（推荐，质量最好）、doubao-seedream-5-0-flash-260915（更快、更便宜）；doubao-seedream-5-0-260128（5.0 lite）、doubao-seedream-4-5-251128、doubao-seedream-4-0-250828 将于 2026-11-24 下线。BytePlus：dola-seedream-5-0-pro-260628、dola-seedream-5-0-flash-260915、seedream-5-0-260128、seedream-4-5-251128、seedream-4-0-250828。使用两边的官方地址时，填错平台的模型 ID 会自动换成对应平台的 ID。"
+        "hint": "模型 ID 或推理接入点 ID（ep-...）。火山方舟：doubao-seedream-5-0-pro-260628（推荐，质量最好）、doubao-seedream-5-0-flash-260915（更快、更便宜）；doubao-seedream-5-0-260128（5.0 lite）、doubao-seedream-4-5-251128、doubao-seedream-4-0-250828 将于 2026-11-24 下线。BytePlus：dola-seedream-5-0-pro-260628、dola-seedream-5-0-flash-260915、seedream-5-0-260128、seedream-4-5-251128、seedream-4-0-250828。使用两边的官方地址时，填错平台的模型 ID 会自动换成对应平台的 ID。以上模型都支持修改图片（按修改指令改图，可同时参考多张图片）：5.0 pro / flash 最多 10 张，5.0 lite / 4.5 / 4.0 最多 14 张，接入点 ID 按 10 张处理；已下线的 SeedEdit 3.0 和只能文生图的 Seedream 3.0 不支持。"
       },
       "portrait_size": {
         "description": "竖图尺寸",
@@ -433,7 +528,7 @@
           "Seedream 4.5",
           "Seedream 4.0"
         ],
-        "hint": "决定尺寸范围和可以发送的参数。自动识别按模型 ID 判断；模型填的是接入点 ID（ep-...）时请选择接入点对应的模型，否则按所有模型通用的保守规则处理（总像素限制在 368 万～462 万，不发送图片格式、快速优化等参数）。"
+        "hint": "决定尺寸范围、可以发送的参数和修改图片最多使用的图片数。自动识别按模型 ID 判断；模型填的是接入点 ID（ep-...）时请选择接入点对应的模型，否则按所有模型通用的保守规则处理（总像素限制在 368 万～462 万，不发送图片格式、快速优化等参数，修改图片最多 10 张）。"
       },
       "output_format": {
         "description": "图片格式",
@@ -469,6 +564,26 @@
         "default": false,
         "hint": "开启后图片右下角带「AI 生成」字样。接口默认会加水印，本插件默认关闭。"
       },
+      "edit_size_mode": {
+        "description": "修改图片的尺寸",
+        "type": "string",
+        "default": "match",
+        "options": [
+          "match",
+          "tier"
+        ],
+        "labels": [
+          "保持原图比例（推荐）",
+          "只指定档位，由模型决定"
+        ],
+        "hint": "接口修改图片时没有「跟随原图」的尺寸选项。保持原图比例：按第一张图片的宽高比和对应方向尺寸设置的面积计算宽x高，并按模型调整到允许范围（输出图片的费用与同尺寸画图相同；5.0 pro 同时参考多张图片时，从第 2 张输入图片起每张另外计费）；用户明确要求换方向时使用该方向的尺寸设置。只指定档位：只发送与尺寸设置面积最接近的档位（如 2K），输出尺寸由模型决定，官方没有说明是否保持原图比例。"
+      },
+      "keep_transparency": {
+        "description": "修改图片时保留透明背景",
+        "type": "bool",
+        "default": false,
+        "hint": "仅 5.0 pro / flash：只修改一张带透明通道的 PNG 图片时，请求透明背景并输出 PNG（忽略图片格式设置）。其他模型或多张图片时不生效，输出不透明背景。"
+      },
       "timeout": {
         "description": "生成超时（秒）",
         "type": "int",
@@ -481,7 +596,43 @@
         "editor_mode": true,
         "editor_language": "json",
         "default": "",
-        "hint": "JSON 对象，最后合并进请求体，可以覆盖插件生成的字段（不做校验，填错模型不支持的值会导致请求失败），例如 {\"optimize_prompt_options\": {\"mode\": \"fast\"}}（仅 5.0 pro / 4.0）。留空表示不添加。"
+        "hint": "JSON 对象，最后合并进请求体（画图和修改图片都会使用），可以覆盖插件生成的字段（不做校验，填错模型不支持的值会导致请求失败），例如 {\"optimize_prompt_options\": {\"mode\": \"fast\"}}（仅 5.0 pro / 4.0）。留空表示不添加。"
+      },
+      "access_key_id": {
+        "description": "Access Key ID（仅用于查询余额）",
+        "type": "string",
+        "default": "",
+        "secret": true,
+        "hint": "只用于 /draw balance 查询账户余额，画图和修改图片不需要；方舟的 API Key 不能查询余额。建议在访问控制（火山引擎 console.volcengine.com/iam，BytePlus 控制台的 IAM）中新建一个子用户，只授予系统策略 BillingCenterReadOnlyAccess（费用中心只读），再为它创建 Access Key，不要使用主账号的密钥。留空则不查询余额。"
+      },
+      "secret_access_key": {
+        "description": "Secret Access Key（仅用于查询余额）",
+        "type": "string",
+        "default": "",
+        "secret": true,
+        "hint": "与 Access Key ID 一起创建（只在创建时显示一次），只用于查询余额，用来给余额查询请求签名，不会发送给其他服务。"
+      },
+      "billing_platform": {
+        "description": "余额查询平台",
+        "type": "string",
+        "default": "auto",
+        "options": [
+          "auto",
+          "volcengine",
+          "byteplus"
+        ],
+        "labels": [
+          "按 API 地址自动判断",
+          "火山引擎",
+          "BytePlus"
+        ],
+        "hint": "查询哪个平台费用中心的余额（主账号的资金余额，所有产品共用）。自动：API 地址是火山方舟（volces.com）时查火山引擎，是 BytePlus（bytepluses.com）时查 BytePlus。使用中转地址时无法自动判断，用的是自己的官方账号时请手动选择；中转服务的余额请到中转服务查看。"
+      },
+      "billing_region": {
+        "description": "余额查询的签名地域",
+        "type": "string",
+        "default": "",
+        "hint": "仅用于查询余额。一般留空：火山引擎使用 cn-beijing，BytePlus 使用 ap-singapore-1。只有余额查询提示签名或地域错误时才需要修改（BytePlus 可以试试 ap-southeast-1），填地域 ID（小写字母、数字和连字符）。"
       }
     }
   },
@@ -500,7 +651,7 @@
         "description": "API 地址",
         "type": "string",
         "default": "https://api.x.ai/v1",
-        "hint": "默认官方地址 https://api.x.ai/v1，请求 /images/generations。只填域名时自动补 /v1，误粘贴的 /images/generations、/chat/completions、/models 等后缀会自动去掉，未写协议时自动补 https://；us.api.x.ai 等区域地址不提供绘图接口，会自动改用 api.x.ai。使用中转服务时改成对应地址。"
+        "hint": "默认官方地址 https://api.x.ai/v1，画图请求 /images/generations，修改图片请求 /images/edits。只填域名时自动补 /v1，误粘贴的 /images/generations、/chat/completions、/models 等后缀会自动去掉，未写协议时自动补 https://；us.api.x.ai 等区域地址不提供绘图接口，会自动改用 api.x.ai。使用中转服务时改成对应地址。"
       },
       "proxy_url": {
         "description": "代理地址",
@@ -512,13 +663,13 @@
         "description": "绘图模型",
         "type": "string",
         "default": "grok-imagine-image-2.0",
-        "hint": "推荐 grok-imagine-image-2.0（约 0.04 美元/张，支持画质设置和 21:9、5:2 宽幅）；grok-imagine-image 是更便宜的 1.0 版（约 0.02 美元/张，不支持画质设置）。也可以填写其他模型 ID，或在「绘图设置」页面获取账号可用的模型列表。grok-imagine-image-quality 将于 2026-11-02 下线（之后由 2.0 以 low 画质代为生成），不建议使用。"
+        "hint": "推荐 grok-imagine-image-2.0（约 0.04 美元/张，支持画质设置和 21:9、5:2 宽幅）；grok-imagine-image 是更便宜的 1.0 版（约 0.02 美元/张，不支持画质设置）。也可以填写其他模型 ID，或在「绘图设置」页面获取账号可用的模型列表。grok-imagine-image-quality 将于 2026-11-02 下线（之后由 2.0 以 low 画质代为生成），不建议使用。修改图片：grok-imagine-image-2.0 每次最多使用 5 张图片，grok-imagine-image（1.0）最多 3 张，已下线的 grok-2-image 不支持修改图片；修改图片按输入图片和输出图片一起计费。"
       },
       "portrait_size": {
         "description": "竖图尺寸",
         "type": "string",
         "default": "2:3",
-        "hint": "xAI 只能指定宽高比，不能指定像素。可填 1:1、3:4、4:3、9:16、16:9、2:3、3:2、9:19.5、19.5:9、9:20、20:9、1:2、2:1、21:9、5:2（最后两个仅 2.0 支持）或 auto（由模型决定）。填其他比例或像素尺寸（如 832x1216）时自动换成最接近的可用比例。"
+        "hint": "xAI 只能指定宽高比，不能指定像素。可填 1:1、3:4、4:3、9:16、16:9、2:3、3:2、9:19.5、19.5:9、9:20、20:9、1:2、2:1、21:9、5:2（最后两个仅 2.0 支持）或 auto（由模型决定）。填其他比例或像素尺寸（如 832x1216）时自动换成最接近的可用比例。修改图片时默认保持原图（第一张图片）的比例，只有要求改变画面方向时才使用这里对应方向的比例。"
       },
       "landscape_size": {
         "description": "横图尺寸",
@@ -542,11 +693,11 @@
           "2k"
         ],
         "labels": [
-          "自动（尺寸填像素且超过约 200 万像素时用 2k，否则 1k）",
+          "自动（画图：尺寸填像素且超过约 200 万像素时用 2k；修改图片：原图超过约 200 万像素时用 2k；否则 1k）",
           "1k（约 100 万像素）",
           "2k（约 400 万像素，价格更高）"
         ],
-        "hint": "生成图片的总像素，具体宽高随宽高比变化。grok-2-image 等旧模型会忽略此项。"
+        "hint": "生成图片的总像素，具体宽高随宽高比变化。grok-2-image 等旧模型会忽略此项。选择自动时，修改较大的照片会用 2k（费用更高），想省钱可以固定为 1k。"
       },
       "quality": {
         "description": "画质",
@@ -560,7 +711,7 @@
         "labels": [
           "medium（细节更好，推荐）",
           "low（更快、更便宜）",
-          "auto（由服务端决定，目前等同 low）"
+          "auto（由服务端决定：画图目前等同 low，修改图片等同 medium）"
         ],
         "hint": "仅 grok-imagine-image-2.0 支持，其他模型会自动忽略。按实际画质计费，官方标价 0.04 美元/张为 medium、1k。"
       },
@@ -576,7 +727,20 @@
         "default": "",
         "editor_mode": true,
         "editor_language": "json",
-        "hint": "可选，JSON 对象，最后合并进请求体，可以覆盖上面的参数，例如 {\"user\": \"astrbot\"}。不要添加 size 字段，xAI 不支持并会直接报错。"
+        "hint": "可选，JSON 对象，最后合并进请求体（画图和修改图片都会使用），可以覆盖上面的参数，例如 {\"user\": \"astrbot\"}。不要添加 size 字段，xAI 不支持并会直接报错；修改图片时其中的 size、image、images 会被忽略。"
+      },
+      "management_key": {
+        "description": "管理密钥（仅用于查询余额）",
+        "type": "string",
+        "default": "",
+        "secret": true,
+        "hint": "可选，只在查询余额时使用，画图和修改图片都不需要。xAI 的余额只能通过管理 API 查询，需要单独的管理密钥（Management Key，不是 API Key）：在 https://console.x.ai 的 Settings → Management Keys 创建（账号需要有 Management Keys 的读写权限）。为了安全，权限只勾选账单（Billing）相关的读取权限，不要勾选充值、付款、修改消费上限或管理 API Key 等权限。不填时请到 https://console.x.ai/team/default/billing 查看余额。"
+      },
+      "team_id": {
+        "description": "团队 ID（仅用于查询余额）",
+        "type": "string",
+        "default": "",
+        "hint": "可选，只在查询余额时使用，一般留空：使用官方 API 地址时先用 API Key 自动获取，获取不到时使用管理密钥所属的团队。需要指定时填写 xAI 控制台团队设置中的团队 ID（UUID 格式，形如 xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx）。"
       }
     }
   },
@@ -589,7 +753,7 @@
         "type": "string",
         "default": "",
         "secret": true,
-        "hint": "在 Google AI Studio https://aistudio.google.com/apikey 创建，通常以 AIza 开头。免费层可能没有图片模型的额度，提示「额度已用尽」时需要在 AI Studio 为项目开通结算。"
+        "hint": "在 Google AI Studio https://aistudio.google.com/apikey 创建，通常以 AIza 开头。免费层可能没有图片模型的额度，提示「额度已用尽」时需要在 AI Studio 为项目开通结算。Gemini API 没有查询余额的接口，预付费余额和交易记录请到 AI Studio 结算页 https://aistudio.google.com/billing 查看，用量见 https://aistudio.google.com/usage。"
       },
       "base_url": {
         "description": "API 地址",
@@ -607,13 +771,13 @@
         "description": "绘图模型",
         "type": "string",
         "default": "gemini-nano-banana-2.1",
-        "hint": "推荐 gemini-nano-banana-2.1（Nano Banana 2.1，速度和价格均衡）；gemini-3-pro-image（Nano Banana Pro，文字渲染和细节最好，较贵较慢）；gemini-3.1-flash-lite-image（最便宜最快，只有 1K）；gemini-3.1-flash-image（上一代，唯一支持 512 档）。也可以填写其他模型 ID，或在「绘图设置」页面获取账号可用的模型列表。已停用的 gemini-3-pro-image-preview 等预览模型会自动换成官方替代模型。"
+        "hint": "推荐 gemini-nano-banana-2.1（Nano Banana 2.1，速度和价格均衡）；gemini-3-pro-image（Nano Banana Pro，文字渲染和细节最好，较贵较慢）；gemini-3.1-flash-lite-image（最便宜最快，只有 1K）；gemini-3.1-flash-image（上一代，唯一支持 512 档）。以上模型都支持修改图片，最多同时使用 14 张图片（已弃用、即将停用的 gemini-2.5-flash-image 只使用前 3 张）；修改时输入图片按约 560-1120 个 token 每张计费。也可以填写其他模型 ID，或在「绘图设置」页面获取账号可用的模型列表。已停用的 gemini-3-pro-image-preview 等预览模型会自动换成官方替代模型。"
       },
       "portrait_size": {
         "description": "竖图尺寸",
         "type": "string",
         "default": "2:3",
-        "hint": "Gemini 只能指定宽高比，不能指定像素。可填 1:1、2:3、3:2、3:4、4:3、4:5、5:4、9:16、16:9、21:9；gemini-nano-banana-2.1 和 gemini-3.1-flash-image 还支持 1:4、4:1、1:8、8:1。填其他比例时自动换成该模型最接近的可用比例；填像素尺寸（如 1024x1536）时换算成最接近的比例，未设置分辨率档位时按像素数选择档位。也可以在后面加档位，如 2:3 2K（优先于「分辨率档位」）。1K 档 2:3 输出 848x1264。"
+        "hint": "Gemini 只能指定宽高比，不能指定像素。可填 1:1、2:3、3:2、3:4、4:3、4:5、5:4、9:16、16:9、21:9；gemini-nano-banana-2.1 和 gemini-3.1-flash-image 还支持 1:4、4:1、1:8、8:1。填其他比例时自动换成该模型最接近的可用比例；填像素尺寸（如 1024x1536）时换算成最接近的比例，未设置分辨率档位时按像素数选择档位。也可以在后面加档位，如 2:3 2K（优先于「分辨率档位」）。1K 档 2:3 输出 848x1264。修改图片时，要求的方向与原图相同（或没有指定方向）则使用该模型支持的、最接近原图的比例，保持原图形状；要求换方向时才使用这里的比例；不知道原图尺寸时不发送比例，由模型按原图决定。"
       },
       "landscape_size": {
         "description": "横图尺寸",
@@ -679,7 +843,7 @@
           "generateContent",
           "Interactions API"
         ],
-        "hint": "自动：使用 generateContent，模型不在该接口上提供（HTTP 404，不计费）时改用 Interactions API 再试一次。中转服务只支持其中一种时可以固定选择。Interactions 请求会设置 store=false，不在 Google 保存记录。"
+        "hint": "自动：使用 generateContent，模型不在该接口上提供（HTTP 404，不计费）时改用 Interactions API 再试一次。中转服务只支持其中一种时可以固定选择。两种接口都支持修改图片（图片以 base64 内联发送）。Interactions 请求会设置 store=false，不在 Google 保存记录（包括用户的图片）；该接口只返回图片，模型拒绝修改时看不到它的文字说明。"
       },
       "timeout": {
         "description": "生成超时（秒）",
@@ -706,13 +870,13 @@
         "type": "string",
         "default": "",
         "secret": true,
-        "hint": "在 SenseNova 开放平台 https://platform.sensenova.cn 的「控制台 → API Keys」创建，以 sk- 开头。国际站 https://platform.sensenova.ai 的 Key 只能配合国际站 API 地址使用。"
+        "hint": "在 SenseNova 开放平台 https://platform.sensenova.cn 的「控制台 → API Keys」创建，以 sk- 开头。国际站 https://platform.sensenova.ai 的 Key 只能配合国际站 API 地址使用。SenseNova 没有能用 API Key 查询积分余额的接口，余额请在控制台首页的额度卡片查看（国内站 https://platform.sensenova.cn/console，国际站 https://platform.sensenova.ai/console）。"
       },
       "base_url": {
         "description": "API 地址",
         "type": "string",
         "default": "https://token.sensenova.cn/v1",
-        "hint": "默认国内站 https://token.sensenova.cn/v1，请求 /images/generations；国际站 Key 请改成 https://token.sensenova.ai/v1（Key 和地址必须属于同一站点）。粘贴完整接口地址时自动截掉 /v1 之后的部分，没有 /v1 时自动补上，未写协议时自动补 https://。旧地址 api.sensenova.cn 已不能画图。"
+        "hint": "默认国内站 https://token.sensenova.cn/v1，画图请求 /images/generations，修改图片请求 /images/edits；国际站 Key 请改成 https://token.sensenova.ai/v1（Key 和地址必须属于同一站点）。粘贴完整接口地址时自动截掉 /v1 之后的部分，没有 /v1 时自动补上，未写协议时自动补 https://。旧地址 api.sensenova.cn 已不能画图。"
       },
       "proxy_url": {
         "description": "代理地址",
@@ -724,13 +888,13 @@
         "description": "绘图模型",
         "type": "string",
         "default": "sensenova-u1.5-lite",
-        "hint": "官方文档目前列出的绘图模型：sensenova-u1.5-lite（推荐，画质更好，支持 4K）、sensenova-u1.5-fast（速度更快）。也可以填写其他模型 ID，或在「绘图设置」页面获取模型列表。sensenova-u1 等旧 ID 已不可用。"
+        "hint": "官方文档目前列出的绘图模型：sensenova-u1.5-lite（推荐，画质更好）、sensenova-u1.5-fast（速度更快），两者都支持 4K，也都支持修改图片（最多 5 张图片，第 1 张为要修改的主图，其余作为参考）。也可以填写其他模型 ID，或在「绘图设置」页面获取模型列表；其他模型不能修改图片。sensenova-u1 等旧 ID 已不可用。"
       },
       "portrait_size": {
         "description": "竖图尺寸",
         "type": "string",
         "default": "1664x2496",
-        "hint": "格式为 宽x高，默认 1664x2496（2:3，2K 推荐尺寸），也可用 1536x2720（9:16）。也可以填 1K / 2K / 4K 使用该档位的推荐尺寸（4K 目前只确认 sensenova-u1.5-lite 支持，其他模型自动改用 2K）、3:4 这样的宽高比（按 2K 计算）或 auto（由服务端决定）。其他宽高会自动调整为 32 的倍数、512-4096 之间、宽高比不超过 3:1。尺寸越大越慢、消耗积分越多。"
+        "hint": "格式为 宽x高，默认 1664x2496（2:3，2K 推荐尺寸），也可用 1536x2720（9:16）。也可以填 1K / 2K / 4K 使用该档位的推荐尺寸（4K 仅 sensenova-u1.5-lite / sensenova-u1.5-fast，其他模型自动改用 2K）、3:4 这样的宽高比（按 2K 计算）或 auto（由服务端决定）。其他宽高会自动调整为 32 的倍数、512-4096 之间、宽高比不超过 3:1。尺寸越大越慢、消耗积分越多。"
       },
       "landscape_size": {
         "description": "横图尺寸",
@@ -744,17 +908,23 @@
         "default": "2048x2048",
         "hint": "同竖图尺寸，默认 2048x2048（2K）；1K 为 1344x1344，4K 为 4096x4096。"
       },
+      "edit_size": {
+        "description": "修改图片的尺寸",
+        "type": "string",
+        "default": "auto",
+        "hint": "默认 auto：输出图片自动适配第 1 张图（要修改的主图）的比例，分辨率由服务端决定。填 1K / 2K / 4K 时按第 1 张图的比例计算该档位的尺寸（4K 仅 sensenova-u1.5-lite / sensenova-u1.5-fast）；填 宽x高 时固定使用该尺寸（会改变原图比例）。尺寸都会自动调整为 32 的倍数、512-4096 之间、宽高比不超过 3:1。用户要求改变画面方向时，按该方向使用上面的竖图 / 横图 / 方图尺寸（这里填了档位时使用该档位的推荐尺寸）。"
+      },
       "watermark": {
         "description": "添加水印",
         "type": "bool",
         "default": false,
-        "hint": "开启后图片会带 SenseNova 标识。接口默认会加水印，插件总是明确发送该参数。公测期间无水印图片免费，以后可能单独收费。"
+        "hint": "开启后图片会带 SenseNova 标识，画图和修改图片都适用。接口默认会加水印，插件总是明确发送该参数。公测期间无水印图片免费，以后可能单独收费。"
       },
       "prompt_extend": {
         "description": "服务端扩写提示词",
         "type": "bool",
         "default": true,
-        "hint": "由 SenseNova 自动改写、丰富提示词（扩写失败时使用原文），改写后的内容不会返回。希望提示词原样生效时关闭。"
+        "hint": "由 SenseNova 自动改写、丰富提示词和修改要求（扩写失败时使用原文），改写后的内容不会返回。希望提示词原样生效时关闭。"
       },
       "output_format": {
         "description": "图片格式",
@@ -770,13 +940,13 @@
           "JPEG（文件更小）",
           "WebP（文件更小）"
         ],
-        "hint": "生成图片的文件格式。"
+        "hint": "生成和修改后图片的文件格式。"
       },
       "timeout": {
         "description": "生成超时（秒）",
         "type": "int",
         "default": 300,
-        "hint": "单次生成的超时时间，取值范围 10-1800，2K / 4K 图片可能需要较长时间。超时后不会自动重试，避免重复扣费；只有连接失败、限流（429）和网关暂时不可用（502 / 503）会自动重试一次，积分额度用尽时不重试。"
+        "hint": "单次生成或修改图片的超时时间，取值范围 10-1800，2K / 4K 图片可能需要较长时间。超时后不会自动重试，避免重复扣费；只有连接失败、限流（429）和网关暂时不可用（502 / 503）会自动重试一次，积分额度用尽时不重试。"
       },
       "extra_body": {
         "description": "额外请求参数",
@@ -784,7 +954,7 @@
         "default": "",
         "editor_mode": true,
         "editor_language": "json",
-        "hint": "可选，JSON 对象，最后合并进请求体，可以覆盖上面的参数，例如 {\"output_format\": \"webp\"}。这里填写的值按原样发送，不会自动调整；不要添加 negative_prompt、seed、n 等文档中没有的字段，可能导致请求失败。"
+        "hint": "可选，JSON 对象，最后合并进请求体（画图和修改图片都会使用），可以覆盖上面的参数，例如 {\"output_format\": \"webp\"}。这里填写的值按原样发送，不会自动调整；修改图片时其中的 images、image、mask、prompt、size、n 会被忽略。不要添加 negative_prompt、seed、n 等文档中没有的字段，可能导致请求失败。"
       }
     }
   },
@@ -797,7 +967,7 @@
         "type": "string",
         "default": "",
         "secret": true,
-        "hint": "本地 ComfyUI 没有鉴权，留空即可。ComfyUI 放在需要鉴权的反向代理后面时填写，以 Authorization: Bearer <Key> 发送（填写 Basic xxx 这样的完整值时原样发送；Basic 认证也可以把用户名密码写进 API 地址，如 http://user:pass@host:8188）。使用 Comfy Cloud 时必填，以 X-API-Key 发送，在 platform.comfy.org 的 API Keys 页面创建（需要有效订阅）。"
+        "hint": "本地 ComfyUI 没有鉴权，留空即可。ComfyUI 放在需要鉴权的反向代理后面时填写，以 Authorization: Bearer <Key> 发送（填写 Basic xxx 这样的完整值时原样发送；Basic 认证也可以把用户名密码写进 API 地址，如 http://user:pass@host:8188）。使用 Comfy Cloud 时必填，以 X-API-Key 发送，在 platform.comfy.org 的 API Keys 页面创建（需要有效订阅）；工作流中的付费 API 节点（Partner Nodes）和查询积分余额（/draw balance）也自动使用这个 Key，不需要另外的密钥。"
       },
       "base_url": {
         "description": "ComfyUI 地址",
@@ -815,7 +985,7 @@
         "description": "模型文件名",
         "type": "string",
         "default": "",
-        "hint": "ComfyUI 中 models/checkpoints 目录下的模型文件名，须与 ComfyUI 中显示的完全一致（子目录按 ComfyUI 所在系统的分隔符书写），例如 sd_xl_base_1.0.safetensors，或 Illustrious-XL、NoobAI-XL 等 SDXL 动漫模型的文件名。可以点「获取模型列表」选择；留空时使用 ComfyUI 模型列表中的第一个。工作流使用 {{model}} 占位符，或只有一个 ckpt_name 时生效。"
+        "hint": "ComfyUI 中 models/checkpoints 目录下的模型文件名，须与 ComfyUI 中显示的完全一致（子目录按 ComfyUI 所在系统的分隔符书写），例如 sd_xl_base_1.0.safetensors，或 Illustrious-XL、NoobAI-XL 等 SDXL 动漫模型的文件名。可以点「获取模型列表」选择；留空时使用 ComfyUI 模型列表中的第一个。工作流使用 {{model}} 占位符，或只有一个 ckpt_name 时生效。修改图片：内置图生图工作流也使用这个模型，SD1.5 / SDXL（含 Illustrious / NoobAI / Pony）的 checkpoint 都可以修改图片（1 张图）；Flux Kontext、Qwen-Image-Edit 等指令编辑模型不在 checkpoints 目录中，需要在「图片修改工作流」中配置（最多 4 张图）。"
       },
       "portrait_size": {
         "description": "竖图尺寸",
@@ -841,7 +1011,15 @@
         "default": "",
         "editor_mode": true,
         "editor_language": "json",
-        "hint": "留空使用内置的 SDXL 文生图工作流（Checkpoint 加载 + 正负提示词 + Empty Latent + KSampler + VAE 解码 + 保存图像），适用于 SDXL / Illustrious / NoobAI / Pony 等模型。Flux、SD3.5 等需要不同节点的模型请粘贴自己的工作流：在 ComfyUI 中点「工作流 → 导出 (API)」（旧版界面在设置中开启开发者模式后点 Save (API Format)）导出，普通保存的工作流不能用。可用占位符：{{prompt}} 正面提示词、{{negative}} 负面提示词、{{model}}（或 {{ckpt_name}}）模型、{{seed}} 种子、{{width}} / {{height}} 尺寸、{{steps}}、{{cfg}}、{{sampler_name}}、{{scheduler}}。整个值是 \"{{seed}}\" 这样的占位符时替换成数字，嵌在文字中（如 \"masterpiece, {{prompt}}\"）时按文字替换。没有 {{prompt}} 时自动填入连接到采样器 positive 的提示词节点；没有 {{seed}} 时每次随机替换 seed / noise_seed；没有 {{width}} / {{height}} 时按画面方向设置 Empty Latent 节点的尺寸。结果取第一个保存图像（SaveImage）节点的图片。"
+        "hint": "留空使用内置的 SDXL 文生图工作流（Checkpoint 加载 + 正负提示词 + Empty Latent + KSampler + VAE 解码 + 保存图像），适用于 SDXL / Illustrious / NoobAI / Pony 等模型。Flux、SD3.5 等需要不同节点的模型请粘贴自己的工作流：在 ComfyUI 中点「工作流 → 导出 (API)」（旧版界面在设置中开启开发者模式后点 Save (API Format)）导出，普通保存的工作流不能用。可用占位符：{{prompt}} 正面提示词、{{negative}} 负面提示词、{{model}}（或 {{ckpt_name}}）模型、{{seed}} 种子、{{width}} / {{height}} 尺寸、{{steps}}、{{cfg}}、{{sampler_name}}、{{scheduler}}。整个值是 \"{{seed}}\" 这样的占位符时替换成数字，嵌在文字中（如 \"masterpiece, {{prompt}}\"）时按文字替换。没有 {{prompt}} 时自动填入连接到采样器 positive 的提示词节点；没有 {{seed}} 时每次随机替换 seed / noise_seed；没有 {{width}} / {{height}} 时按画面方向设置 Empty Latent 节点的尺寸。结果取第一个保存图像（SaveImage）节点的图片。修改图片使用下面单独的「图片修改工作流」。"
+      },
+      "edit_workflow_json": {
+        "description": "图片修改工作流（API 格式 JSON）",
+        "type": "text",
+        "default": "",
+        "editor_mode": true,
+        "editor_language": "json",
+        "hint": "修改用户发来的图片时使用的工作流。留空使用内置的 SDXL 图生图工作流：加载图像 → 按总像素缩放（保持原图宽高比，总像素与上面该方向的尺寸设置相同；明确要求换方向时居中裁切到该方向的尺寸）→ VAE 编码 → KSampler（denoise 为重绘幅度：LLM 按修改要求给出，或「通用绘图设置」中的图生图默认重绘幅度）→ 保存图像。内置工作流只使用 1 张图片、使用上面的模型，透明 PNG 会先铺上白底。Qwen-Image-Edit、Flux Kontext 等指令编辑模型请粘贴自己的工作流（「工作流 → 导出 (API)」）：在加载图像（LoadImage）节点的 image 中写 {{image}}（第 1 张图），多图工作流用 {{image1}} 到 {{image4}}，最多 4 张；用户发的图片比占位符少时，多余的加载图像节点和只为它服务的节点会被删除。没有图片占位符时按节点编号顺序把图片填入前几个 LoadImage 节点。插件会先把图片上传到 ComfyUI 的 input/astrbot/ 目录（Comfy Cloud 上传到云端），文件名按内容去重。除文生图工作流的全部占位符外，还可以用 {{denoise}} 重绘幅度（工作流用到它时 LLM 才会给出重绘幅度）、{{megapixels}} 目标总像素（百万像素）；{{width}} / {{height}} 为按第 1 张图的宽高比换算的尺寸（对齐到 64；明确要求换方向时为该方向的尺寸）。Qwen-Image-Edit 等节点的提示词输入（prompt）不会自动填入，须写 {{prompt}}。指令编辑模型理解自然语言，请把下面的「修改图片的提示词方式」设为「自然语言修改指令」（绘图仍使用内置 SDXL 工作流时，「提示词方式」保持标签）。"
       },
       "steps": {
         "description": "采样步数",
@@ -879,7 +1057,23 @@
           "Danbooru 标签（SDXL 动漫模型）",
           "自然语言（Flux、SD3.5 等）"
         ],
-        "hint": "LLM 生成提示词的方式。Illustrious / NoobAI / Pony 等 SDXL 动漫模型用 Danbooru 标签；Flux、SD3.5、Qwen-Image 等理解自然语言的模型（需要自定义工作流）选自然语言。"
+        "hint": "LLM 生成提示词的方式。Illustrious / NoobAI / Pony 等 SDXL 动漫模型用 Danbooru 标签；Flux、SD3.5、Qwen-Image 等理解自然语言的模型（需要自定义工作流）选自然语言。「修改图片的提示词方式」留空时，修改图片也按这里的方式生成：标签模式生成结果图的标签和重绘幅度（适合内置图生图），自然语言模式生成英文修改指令（适合 Qwen-Image-Edit、Flux Kontext 等指令编辑工作流）。"
+      },
+      "edit_prompt_mode": {
+        "description": "修改图片的提示词方式",
+        "type": "string",
+        "default": "",
+        "options": [
+          "",
+          "tags",
+          "natural"
+        ],
+        "labels": [
+          "与绘图相同",
+          "标签（图生图）",
+          "自然语言修改指令"
+        ],
+        "hint": "修改图片时 LLM 生成什么样的提示词。内置的 SDXL 图生图工作流用「标签」；自定义修改工作流使用 Qwen-Image-Edit、FLUX Kontext 等按指令改图的模型时选「自然语言修改指令」。留空则与上面的提示词方式相同。"
       },
       "required_positive": {
         "description": "必定包含的正面提示词",
@@ -905,7 +1099,7 @@
         "default": "",
         "editor_mode": true,
         "editor_language": "json",
-        "hint": "JSON 对象，最后合并到提交工作流的请求体（POST /prompt）中，可以覆盖同名字段。例如使用付费 API 节点时填 {\"extra_data\": {\"api_key_comfy_org\": \"comfyui-...\"}}；填 {\"front\": true} 插到队列最前（Comfy Cloud 会忽略）。留空则不添加。"
+        "hint": "JSON 对象，最后合并到提交工作流的请求体（POST /prompt）中，可以覆盖同名字段。例如本地 ComfyUI 使用付费 API 节点时填 {\"extra_data\": {\"api_key_comfy_org\": \"comfyui-...\"}}（填写后本地 ComfyUI 也可以用这个 Key 查询 comfy.org 的积分余额；Comfy Cloud 会自动带上上面的 API Key，不用填写）；填 {\"front\": true} 插到队列最前（Comfy Cloud 会忽略）。留空则不添加。"
       }
     }
   },
@@ -931,6 +1125,12 @@
         "type": "text",
         "default": "You are an expert prompt writer for modern text-to-image models such as GPT Image, Gemini, Seedream, Grok Imagine and FLUX.\nYour task: turn the user's drawing request (it may be written in Chinese or any other language) into ONE detailed English image description that will be sent directly to the image model.\n\nRules for \"prompt\":\n- Fluent natural English sentences (about 60-200 words), not a list of tags.\n- Describe the main subject first (for known characters give the character name and series), then appearance, clothing, expression, pose/action, held objects, the setting/background, lighting, color palette, mood, composition/camera angle and art style/medium.\n- Be concrete and visual; turn abstract ideas into visible elements. Fill in reasonable details the user did not specify, but never contradict the request.\n- If the user wants specific text to appear in the image, quote that text exactly in its original language and say where it appears.\n- Do not mention image size, aspect ratio, resolution or model parameters.\n\nRules for \"negative\": a short English list of things to avoid that are specific to this request (may be an empty string).\n\nRules for \"orientation\": portrait for single characters / full body; landscape for scenery, wide scenes or several characters side by side; square for icons, avatars or close-up faces.",
         "hint": "OpenAI、Seedream、xAI、Gemini、SenseNova（以及选择了自然语言模式的 ComfyUI）使用：让 LLM 把绘图需求写成一段详细的画面描述。输出格式（JSON）和未成年人安全规则会固定附加在后面。留空则使用默认值。"
+      },
+      "edit_system_prompt": {
+        "description": "修改图片的系统提示词（自然语言模式）",
+        "type": "text",
+        "default": "You are an expert at writing instructions for AI image-editing models such as GPT Image, Gemini, Seedream and Grok Imagine.\nYour task: turn the user's editing request (it may be written in Chinese or any other language) into ONE clear English editing instruction. It will be sent to the image model together with the user's image(s). If the images are attached to this message, look at them first.\n\nRules for \"prompt\":\n- Say precisely what to change, then what must stay the same (for example the character's identity and face, pose, composition, art style and background), unless the user wants those changed too.\n- Be concrete and visual, and keep it short: 1-4 sentences.\n- When several images are given, refer to them as \"image 1\", \"image 2\", ... in the order given.\n- If the user wants text in the image, quote that text exactly in its original language.\n- Do not mention image size, aspect ratio, resolution or model parameters.\n\nRules for \"negative\": things to avoid that are specific to this edit (may be an empty string).\n\nRules for \"orientation\": leave it empty to keep the original image's aspect ratio; use portrait/landscape/square only if the user asks to change it.",
+        "hint": "修改图片时，让 LLM 把用户的修改要求写成一段英文修改指令（说明改什么、保留什么）。LLM 支持图片输入时会同时看到原图。标签模式（NovelAI / ComfyUI）修改图片时使用上面的标签模式系统提示词，并固定附加图生图规则。输出格式和未成年人安全规则会固定附加在后面。留空则使用默认值。"
       },
       "sfw_only": {
         "description": "仅生成全年龄内容",

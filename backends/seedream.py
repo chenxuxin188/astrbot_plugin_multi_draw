@@ -1,26 +1,38 @@
-"""Seedream（火山方舟 / BytePlus ModelArk）文生图后端。
+"""Seedream（火山方舟 / BytePlus ModelArk）文生图、图片修改与余额查询后端。
 
-接口：POST {base}/images/generations，Authorization: Bearer <API Key>，一次生成一张，返回 b64_json。
+绘图：POST {base}/images/generations，Authorization: Bearer <API Key>，一次生成一张，返回 b64_json。
+修改图片使用同一个接口，在 JSON 请求体中加 image 字段（data URL，单张为字符串、多张为数组）。
 文档（2026-10）：https://www.volcengine.com/docs/82379/1541523
+
+余额：方舟 API Key 不能查询余额，使用费用中心 OpenAPI QueryBalanceAcct（IAM Access Key 签名，
+https://www.volcengine.com/docs/6269/1223898 ，签名方法 https://www.volcengine.com/docs/6369/67269 ）。
 """
 
+import base64
+import datetime
+import hashlib
+import hmac
 import math
 import re
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from .base import (
     Backend,
+    BalanceInfo,
     Clients,
     DrawError,
     DrawRequest,
     DrawResult,
+    InputImage,
     as_bool,
     as_float,
     as_str,
     decode_b64_image,
+    detect_mime,
     download_image,
     error_from_response,
     final_prompt,
+    image_orientation,
     image_result,
     json_body,
     mask_secret,
@@ -82,6 +94,30 @@ _TABLE_4 = {  # 5.0 lite / 4.5 / 4.0（1K 仅 4.0，3K 仅 5.0 lite）
 _WXH_RE = re.compile(r"(?<![\d.])(\d{1,6})\s*x\s*(\d{1,6})(?!\d|\.\d)")
 _RATIO_RE = re.compile(r"(?<![\d.])(\d{1,4}(?:\.\d{1,3})?)\s*:\s*(\d{1,4}(?:\.\d{1,3})?)(?!\d|\.\d)")
 _TIER_RE = re.compile(r"(?<![\d.])(\d{1,2}(?:\.\d{1,2})?)\s*k")
+
+# ---------------------------------------------------------------- 图片修改的限制
+
+# 各系列修改图片时最多接受的输入图片数；接入点 ID 无法判断系列，按较小的值处理
+EDIT_MAX_IMAGES = {"5.0-pro": 10, "5.0-flash": 10, "5.0-lite": 14, "4.5": 14, "4.0": 14, "generic": 10}
+MAX_EDIT_IMAGES = max(EDIT_MAX_IMAGES.values())
+FAMILY_NAMES = {"5.0-pro": "5.0 pro", "5.0-flash": "5.0 flash", "5.0-lite": "5.0 lite", "4.5": "4.5", "4.0": "4.0",
+                "generic": "接入点 / 未识别的模型"}
+# 修改图片的尺寸：match 按第一张图片的宽高比计算宽x高（接口没有「跟随原图」的尺寸）；tier 只发送档位，由模型决定
+EDIT_SIZE_MODES = ("match", "tier")
+DEFAULT_EDIT_SIZE_MODE = "match"
+# 输入图片的限制：单张不超过 30 MB（文档没说是 10^6 还是 2^20，取较小值），宽高都大于 14 像素，
+# 宽高比 1/16 ~ 16，总像素 196 ~ 6000x6000
+INPUT_MAX_BYTES = 30 * 1000 * 1000
+INPUT_MIN_PIXELS = 196
+INPUT_MAX_PIXELS = 36_000_000
+# data URL 中的图片格式必须小写
+_DATA_URL_FORMAT = {"image/png": "png", "image/jpeg": "jpeg", "image/webp": "webp", "image/gif": "gif",
+                    "image/bmp": "bmp", "image/tiff": "tiff", "image/heic": "heic", "image/heif": "heif"}
+# 不能修改图片的模型（只认没有选择模型系列时的模型 ID）
+_NO_EDIT_MODELS = (
+    (re.compile(r"seededit"), "SeedEdit 3.0 已于 2026-03-31 下线，请改用 doubao-seedream-5-0-pro-260628 等 Seedream 模型"),
+    (re.compile(r"seedream-3-0"), "Seedream 3.0 只能文生图且已下线，请改用 Seedream 4.0 及以上的模型"),
+)
 
 
 def detect_family(model: str) -> str:
@@ -176,6 +212,57 @@ def platform_model(model: str, base_url: str) -> str:
     return model
 
 
+# ---------------------------------------------------------------- 图片修改
+
+
+def image_data_url(image: InputImage, label: str, index: int) -> str:
+    """把输入图片转成 data:image/<小写格式>;base64,... ，格式不支持或超过 30 MB 时报错。"""
+    data = image.data or b""
+    if not data:  # 空的 data URL 会被接口拒绝（InvalidImageURL.EmptyURL），提前报错
+        raise DrawError(f"{label} 第 {index} 张图片没有数据")
+    mime = detect_mime(data) or as_str(image.mime).lower()
+    fmt = _DATA_URL_FORMAT.get(mime)
+    if not fmt:
+        raise DrawError(f"{label} 不支持第 {index} 张图片的格式（支持 jpeg / png / webp / bmp / gif 等）")
+    if len(data) > INPUT_MAX_BYTES:
+        raise DrawError(f"{label} 要求每张图片不超过 30 MB，第 {index} 张过大")
+    return f"data:image/{fmt};base64,{base64.b64encode(data).decode('ascii')}"
+
+
+def check_input_size(image: InputImage, label: str, index: int) -> None:
+    """检查输入图片的宽高是否在接口允许的范围内；不知道尺寸时交给接口判断。"""
+    width, height = image.width or 0, image.height or 0
+    if width <= 0 or height <= 0:
+        return
+    if width <= 14 or height <= 14 or width * height < INPUT_MIN_PIXELS:
+        raise DrawError(f"{label} 要求图片宽高都大于 14 像素，第 {index} 张太小（{width}x{height}）")
+    if not 1 / 16 <= width / height <= 16:
+        raise DrawError(f"{label} 要求图片宽高比在 1:16 ~ 16:1 之间，第 {index} 张过于细长（{width}x{height}）")
+    if width * height > INPUT_MAX_PIXELS:
+        raise DrawError(f"{label} 要求图片总像素不超过 6000x6000，第 {index} 张过大（{width}x{height}）")
+
+
+def png_has_alpha(data: bytes) -> bool:
+    """PNG 是否带透明通道：IHDR 的颜色类型为 4 / 6（灰度 + Alpha、RGBA），或在 IDAT 之前有 tRNS 块。"""
+    if detect_mime(data) != "image/png":
+        return False
+    pos = 8
+    while pos + 8 <= len(data):
+        length = int.from_bytes(data[pos:pos + 4], "big")
+        kind = data[pos + 4:pos + 8]
+        if kind == b"IHDR":
+            if pos + 18 > len(data):
+                return False
+            if data[pos + 17] in (4, 6):  # 数据区第 10 个字节是颜色类型
+                return True
+        elif kind == b"tRNS":
+            return True
+        elif kind in (b"IDAT", b"IEND"):
+            return False
+        pos += 12 + length
+    return False
+
+
 # ---------------------------------------------------------------- 错误处理
 
 # 内容审核拦截（不重试，提示用户换个描述）
@@ -238,6 +325,136 @@ def seedream_error(label: str, status: int, body, headers=None) -> DrawError:
     return DrawError(message, status=status, retryable=retryable, retry_after=base.retry_after)
 
 
+# 输入图片未通过审核的错误码（前缀匹配，越具体的放越前面）
+_INPUT_IMAGE_MODERATION = (
+    ("InputImageSensitiveContentDetected.PrivacyInformation", "输入的图片可能包含真实人物"),
+    ("InputImageSensitiveContentDetected.PolicyViolation", "输入的图片可能涉及版权限制"),
+    ("InputImageSensitiveContentDetected", "输入的图片未通过内容安全审核"),
+    ("InputImageRiskDetection", "输入的图片未通过内容安全审核"),
+)
+
+
+def seedream_edit_error(label: str, status: int, body, headers=None) -> DrawError:
+    """修改图片的错误响应：输入图片审核、图片无法解析、请求体过大（都不重试），其余同 seedream_error。"""
+    code, _ = _error_info(body)
+    target = next((t for prefix, t in _INPUT_IMAGE_MODERATION if code.startswith(prefix)), "")
+    if target:
+        return DrawError(f"{label} 拒绝修改：{target}，请换一张图片再试（{code}）", status=status)
+    text = ""
+    if code.startswith("InvalidImageURL"):
+        text = "无法解析输入的图片（Base64 格式不正确、图片数据损坏或格式不支持）"
+    elif status == 413:  # 推理接口没有 413 的错误码，网关可能返回 HTML，按状态码判断
+        text = "图片数据过大，请减少图片数量或缩小图片"
+    if text:
+        return DrawError(f"{label} {text}（HTTP {status}{f'，{code}' if code else ''}）", status=status)
+    return seedream_error(label, status, body, headers)
+
+
+# ---------------------------------------------------------------- 余额查询（费用中心 OpenAPI）
+
+BILLING_SERVICE = "billing"
+BILLING_VERSION = "2022-01-01"
+BILLING_TIMEOUT = 30.0
+# 费用中心是全局服务；非地域性产品签名时可以使用任意地域（BytePlus 的地域未经真实密钥验证，可在配置中修改）
+BILLING = {
+    "volcengine": {"name": "火山引擎", "host": "billing.volcengineapi.com", "region": "cn-beijing", "unit": "元",
+                   "console": "https://console.volcengine.com/finance/fund/recharge"},
+    # BytePlus 的返回没有币种字段，只有 BytePlus Pte. Ltd. 签约的账户确定是美元，因此不写单位
+    "byteplus": {"name": "BytePlus", "host": "billing.byteplusapi.com", "region": "ap-singapore-1", "unit": "",
+                 "console": "https://console.byteplus.com/finance/overview"},
+}
+BILLING_PLATFORMS = ("auto", "volcengine", "byteplus")
+# 地域 ID 只有小写字母、数字和连字符（如 cn-beijing、ap-singapore-1）；其他字符会让签名请求头非法
+_REGION_RE = re.compile(r"[a-z0-9-]{1,64}")
+_CURRENCY_UNIT = {"CNY": "元", "RMB": "元", "USD": "美元"}
+# ResponseMetadata.Error.Code 的说明。Error.Message 会原样带出 Access Key，从不展示
+_BILLING_CODE_TEXT = {
+    "InvalidAccessKey": "Access Key ID 不存在或已停用",
+    "InvalidSecretToken": "Access Key 无效",
+    "SignatureDoesNotMatch": "签名不匹配，请检查 Secret Access Key 是否正确",
+    "InvalidCredential": "Access Key 格式不正确",
+    "InvalidAuthorization": "Access Key 格式不正确",
+    "InvalidTimestamp": "签名已过期，请检查服务器时间是否准确",
+    "AccessDenied": "该 Access Key 所属用户没有查询余额的权限（请授予系统策略 BillingCenterReadOnlyAccess）",
+    "FlowLimitExceeded": "查询过于频繁，请稍后再试",
+    "ServiceUnavailableTemp": "费用中心暂时不可用，请稍后再试",
+    "InternalServiceTimeout": "费用中心响应超时，请稍后再试",
+    "InternalServiceError": "费用中心暂时不可用，请稍后再试",
+}
+# 查询余额是只读请求，限流和网关错误可以安全重试
+_BILLING_RETRY_CODES = ("FlowLimitExceeded", "ServiceUnavailableTemp", "InternalServiceTimeout", "InternalServiceError")
+
+
+def _hmac_sha256(key: bytes, msg: str) -> bytes:
+    return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+
+def canonical_query(query: dict) -> str:
+    """规范化查询字符串：名称和值按 RFC 3986 编码（空格为 %20，只保留 -_.~ 不编码），按名称排序。"""
+    def enc(value) -> str:
+        return quote(str(value), safe="-_.~")
+
+    return "&".join(f"{enc(k)}={enc(v)}" for k, v in sorted(query.items(), key=lambda kv: enc(kv[0])))
+
+
+def canonical_request(method: str, host: str, query: dict, body: bytes, x_date: str) -> str:
+    """签名用的规范请求，只签 host 与 x-date 两个请求头（与官方签名文档的示例相同）。"""
+    return "\n".join([
+        method.upper(), "/", canonical_query(query),
+        f"host:{host.strip()}\nx-date:{x_date}\n", "host;x-date", hashlib.sha256(body).hexdigest(),
+    ])
+
+
+def sign_v4(method: str, host: str, query: dict, body: bytes, access_key_id: str, secret_access_key: str,
+            region: str, service: str, now: datetime.datetime | None = None) -> dict:
+    """火山引擎 / BytePlus OpenAPI 的 HMAC-SHA256 签名，返回需要附加的 X-Date 与 Authorization 请求头。
+
+    https://www.volcengine.com/docs/6369/67269 ：kDate = HMAC(SK, 日期)，依次以地域、服务、"request" 派生签名密钥，
+    对 "HMAC-SHA256\\n X-Date \\n 凭证范围 \\n sha256(规范请求)" 签名。
+    """
+    x_date = (now or datetime.datetime.now(datetime.timezone.utc)).strftime("%Y%m%dT%H%M%SZ")
+    scope = f"{x_date[:8]}/{region}/{service}/request"
+    digest = hashlib.sha256(canonical_request(method, host, query, body, x_date).encode("utf-8")).hexdigest()
+    string_to_sign = f"HMAC-SHA256\n{x_date}\n{scope}\n{digest}"
+    key = _hmac_sha256(secret_access_key.encode("utf-8"), x_date[:8])
+    for part in (region, service, "request"):
+        key = _hmac_sha256(key, part)
+    signature = hmac.new(key, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+    return {
+        "X-Date": x_date,
+        "Authorization": f"HMAC-SHA256 Credential={access_key_id}/{scope}, SignedHeaders=host;x-date, "
+                         f"Signature={signature}",
+    }
+
+
+def billing_error(label: str, status: int, body, headers=None) -> DrawError:
+    """费用中心的错误响应 {"ResponseMetadata": {"Error": {"Code", "Message"}}}；只展示错误码对应的说明。"""
+    meta = body.get("ResponseMetadata") if isinstance(body, dict) else None
+    err = meta.get("Error") if isinstance(meta, dict) and isinstance(meta.get("Error"), dict) else {}
+    code = as_str(err.get("Code"))
+    reason = _BILLING_CODE_TEXT.get(code) or ("服务器错误" if status >= 500 else "查询失败")
+    retry_after = error_from_response(label, status, None, headers).retry_after
+    return DrawError(f"{label} 余额查询失败：{reason}（HTTP {status}{f'，{code}' if code else ''}）", status=status,
+                     retryable=code in _BILLING_RETRY_CODES or status in (429, 502, 503, 504),
+                     retry_after=retry_after)
+
+
+def _money(value, unit: str) -> str:
+    text = as_str(value) or "0"
+    try:
+        text = f"{float(text):,.2f}"
+    except (ValueError, OverflowError):
+        pass
+    return f"{text} {unit}".strip()
+
+
+def _nonzero(value) -> bool:
+    try:
+        return float(as_str(value) or 0) != 0
+    except (ValueError, OverflowError):
+        return bool(as_str(value))
+
+
 # ---------------------------------------------------------------- 后端
 
 
@@ -250,6 +467,20 @@ class SeedreamBackend(Backend):
     supports_models = False
     max_concurrency = None
     doc_url = "https://www.volcengine.com/docs/82379/1541523"
+    # 所有模型系列的最大值；实例上按当前模型系列给出（5.0 pro / flash 与接入点 10 张，其余 14 张）
+    max_edit_images = MAX_EDIT_IMAGES
+    # 没有重绘幅度参数，按修改指令修改图片
+    supports_strength = False
+    # 需要单独配置 IAM Access Key（方舟 API Key 不能查询余额）
+    supports_balance = True
+    billing_url = BILLING["volcengine"]["console"]
+
+    def __init__(self, section: dict | None):
+        super().__init__(section)
+        # 插件按实例上的 max_edit_images 截取输入图片，网页按 billing_url 显示账单页面
+        # （family / billing_platform 对任何配置值都不会抛出异常）
+        self.max_edit_images = EDIT_MAX_IMAGES.get(self.family, EDIT_MAX_IMAGES["generic"])
+        self.billing_url = BILLING[self.billing_platform or "volcengine"]["console"]
 
     @property
     def api_key(self) -> str:
@@ -341,15 +572,105 @@ class SeedreamBackend(Backend):
                 e.args = (str(e).replace(key, mask_secret(key)),)
             raise
 
+    # ------------------------------------------------------------ 图片修改
+
+    @property
+    def edit_size_mode(self) -> str:
+        mode = as_str(self.section.get("edit_size_mode")).lower()
+        return mode if mode in EDIT_SIZE_MODES else DEFAULT_EDIT_SIZE_MODE
+
+    def edit_size(self, req: DrawRequest) -> str:
+        """修改图片的 size。接口没有「自动 / 跟随原图」的尺寸（auto 只用于图层拆分），只能发档位或宽x高。
+
+        match：按第一张图片的宽高比与该方向配置尺寸的面积计算宽x高，再调整到模型允许的范围；
+        画面方向与原图不同（用户明确要求换方向）或不知道原图尺寸时，使用该方向的配置尺寸。
+        tier：只发送与配置尺寸面积最接近的档位（如 2K），由模型决定输出尺寸。
+        """
+        rules = FAMILIES[self.family]
+        first = req.images[0] if req.images else None
+        shape = image_orientation(first) if first else ""
+        orientation = req.orientation if req.orientation in DEFAULT_SIZES else (shape or "portrait")
+        configured = self.size(orientation)
+        w0, h0 = (int(v) for v in configured.split("x"))
+        if self.edit_size_mode == "tier":
+            area = w0 * h0
+            return min(rules["tiers"], key=lambda t: abs(math.log(area / (TIER_VALUES[t] * 1024) ** 2)))
+        if not shape or shape != orientation:
+            return configured
+        ratio = min(16.0, max(1 / 16, first.width / first.height))
+        width = max(16, round(math.sqrt(w0 * h0 * ratio) / 16) * 16)
+        height = max(16, round(math.sqrt(w0 * h0 / ratio) / 16) * 16)
+        return "%dx%d" % fit_pixels(width, height, *rules["pixels"])
+
+    def edit_missing(self) -> str:
+        """所有 Seedream 4.0 及以上的模型都能修改图片；已下线的 SeedEdit 3.0、只能文生图的 3.0 不能。"""
+        if self.family == "generic":
+            name = re.sub(r"[._\s]", "-", self.model.lower())
+            for pattern, reason in _NO_EDIT_MODELS:
+                if pattern.search(name):
+                    return f"当前模型 {self.model} 不支持修改图片：{reason}"
+        return ""
+
+    def build_edit_body(self, req: DrawRequest) -> dict:
+        reason = self.edit_missing()
+        if reason:
+            raise DrawError(reason)
+        limit = self.max_edit_images
+        if len(req.images) > limit:
+            raise DrawError(f"{self.label} {FAMILY_NAMES[self.family]} 修改图片最多使用 {limit} 张图片，"
+                            f"本次有 {len(req.images)} 张")
+        urls = []
+        for index, image in enumerate(req.images, 1):
+            check_input_size(image, self.label, index)
+            urls.append(image_data_url(image, self.label, index))
+        rules = FAMILIES[self.family]
+        body = {
+            "model": self.model,
+            # 修改指令按数组顺序称呼图片（image 1 / 图1）；接口没有负面提示词、重绘幅度、种子、蒙版等字段
+            "prompt": final_prompt(req, self.supports_negative),
+            "image": urls[0] if len(urls) == 1 else urls,
+            "size": self.edit_size(req),
+            "response_format": "b64_json",
+            "watermark": as_bool(self.section.get("watermark"), False),
+        }
+        # 与文生图相同：不发送组图开关 sequential_image_generation（5.0 pro / flash 不接受，默认只出一张）
+        if rules["output_format"]:
+            fmt = as_str(self.section.get("output_format")).lower()
+            body["output_format"] = fmt if fmt in ("png", "jpeg") else DEFAULT_OUTPUT_FORMAT
+        if rules["fast"] and as_str(self.section.get("optimize_mode")).lower() == "fast":
+            body["optimize_prompt_options"] = {"mode": "fast"}
+        # 透明背景：仅 5.0 pro / flash、只有一张带透明通道的输入图片时可用，且必须输出 PNG
+        if (as_bool(self.section.get("keep_transparency"), False) and self.family in ("5.0-pro", "5.0-flash")
+                and len(req.images) == 1 and png_has_alpha(req.images[0].data)):
+            body["background"] = "transparent"
+            body["output_format"] = "png"
+        extra = self.section.get("extra_body")
+        body.update(extra if isinstance(extra, dict) else parse_extra_json(as_str(extra), self.label))
+        return body
+
+    def plan(self, req: DrawRequest) -> dict:
+        if not req.is_edit:
+            return super().plan(req)
+        params = {"model": self.model, "mode": "edit", "input_images": len(req.images)}
+        try:
+            params["size"] = self.edit_size(req)
+        except DrawError:  # 尺寸无法调整到允许范围时由 generate() 报告
+            pass
+        return params
+
     async def _generate(self, clients: Clients, req: DrawRequest) -> DrawResult:
         reason = self.missing()
         if reason:
             raise DrawError(reason)
-        body = self.build_body(req)
+        if req.is_edit:
+            body, on_error = self.build_edit_body(req), seedream_edit_error
+        else:
+            body, on_error = self.build_body(req), seedream_error
         headers = {"Authorization": f"Bearer {self.api_key}"}
+        # 只重试连接失败、限流（不含额度用尽）和 502 / 503；超时不重试，服务端可能已经生成并计费
         resp = await with_retries(lambda: send(
             clients.http, "POST", self.endpoint, label=self.label, proxy=self.proxy, timeout=self.timeout,
-            on_error=seedream_error, headers=headers, json=body,
+            on_error=on_error, headers=headers, json=body,
         ))
         data = json_body(resp, self.label)
         items = data.get("data") if isinstance(data.get("data"), list) else []
@@ -359,8 +680,8 @@ class SeedreamBackend(Backend):
             # 整个请求没有生成图片时，错误放在顶层 error（组图模式下也可能在单张图的 error 里）
             error = next((i["error"] for i in items if i.get("error")), None) or data.get("error")
             if error:
-                raise seedream_error(self.label, resp.status_code,
-                                     {"error": error} if isinstance(error, dict) else error, resp.headers)
+                raise on_error(self.label, resp.status_code,
+                               {"error": error} if isinstance(error, dict) else error, resp.headers)
             raise DrawError(f"{self.label} 没有返回图片：{response_detail(data)[:200]}")
         if item.get("b64_json"):
             image = decode_b64_image(item["b64_json"], self.label)
@@ -374,13 +695,117 @@ class SeedreamBackend(Backend):
             "watermark": body.get("watermark"),
         }
         if body.get("output_format"):
+            # 返回中的 output_format 只有 5.0 pro / flash 提供
             params["output_format"] = as_str(item.get("output_format")) or body["output_format"]
         if isinstance(body.get("optimize_prompt_options"), dict):
             params["optimize_mode"] = body["optimize_prompt_options"].get("mode")
+        if req.is_edit:
+            params["mode"] = "edit"
+            params["input_images"] = len(req.images)
+            if body.get("background"):
+                params["background"] = body["background"]
         request_id = resp.headers.get("x-request-id")
         if request_id:
             params["request_id"] = request_id
         return image_result(image, params)
+
+    # ------------------------------------------------------------ 余额查询
+
+    @property
+    def access_key(self) -> tuple[str, str]:
+        """(Access Key ID, Secret Access Key)，去掉误粘贴的空白和换行。"""
+        return ("".join(as_str(self.section.get("access_key_id")).split()),
+                "".join(as_str(self.section.get("secret_access_key")).split()))
+
+    @property
+    def billing_platform(self) -> str:
+        """查询哪个平台的费用中心：配置指定，或按 API 地址判断；第三方中转地址返回空串。"""
+        chosen = as_str(self.section.get("billing_platform")).lower()
+        if chosen in BILLING:
+            return chosen
+        try:
+            host = (urlsplit(self.base_url).hostname or "").lower()
+        except ValueError:
+            return ""
+        if host.endswith("bytepluses.com"):
+            return "byteplus"
+        if host.endswith("volces.com"):
+            return "volcengine"
+        return ""
+
+    def balance_missing(self) -> str:
+        """方舟 API Key 不能查询余额，因此不检查 missing()，只检查 Access Key 和平台。"""
+        platform = self.billing_platform
+        if not platform:
+            return (f"{self.label} 当前 API 地址不是火山方舟 / BytePlus 的官方地址，无法自动判断余额查询平台；"
+                    "使用官方账号时请在配置中选择「余额查询平台」，中转服务的余额请到中转服务的网站查看")
+        ak, sk = self.access_key
+        if not (ak and sk):
+            return (f"{self.label} 的 API Key 不能查询余额：需要在配置中填写 Access Key ID 和 Secret Access Key"
+                    f"（建议为只授予 BillingCenterReadOnlyAccess 权限的子用户创建），或到 {BILLING[platform]['console']} 查看")
+        if not (ak.isascii() and ak.isprintable() and sk.isascii() and sk.isprintable()):
+            return f"{self.label} 的 Access Key 含有中文、全角或不可见字符，请重新复制"
+        if not _REGION_RE.fullmatch(self.billing_region):
+            return f"{self.label} 的余额查询签名地域格式不正确（应为 cn-beijing、ap-singapore-1 这样的地域 ID），一般留空即可"
+        return ""
+
+    @property
+    def billing_region(self) -> str:
+        """签名用的地域：配置指定（去掉空白、转成小写），留空时使用平台的默认地域。"""
+        region = "".join(as_str(self.section.get("billing_region")).split()).lower()
+        return region or BILLING[self.billing_platform or "volcengine"]["region"]
+
+    async def balance(self, clients: Clients) -> BalanceInfo:
+        try:
+            return await self._balance(clients)
+        except DrawError as e:
+            # 防御：Access Key / Secret 不能出现在展示给用户、写入日志的错误中
+            text = str(e)
+            for secret in self.access_key:
+                if len(secret) >= 8 and secret in text:
+                    text = text.replace(secret, mask_secret(secret))
+            e.args = (text,)
+            raise
+
+    async def _balance(self, clients: Clients) -> BalanceInfo:
+        reason = self.balance_missing()
+        if reason:
+            raise DrawError(reason)
+        ak, sk = self.access_key
+        platform = self.billing_platform
+        cfg = BILLING[platform]
+        region = self.billing_region
+        query = {"Action": "QueryBalanceAcct", "Version": BILLING_VERSION}
+        url = f"https://{cfg['host']}/?{canonical_query(query)}"  # 与签名时相同的编码
+
+        def request():  # 每次重试都重新签名（X-Date 更新，签名默认 15 分钟内有效）
+            headers = sign_v4("GET", cfg["host"], query, b"", ak, sk, region, BILLING_SERVICE)
+            return send(clients.http, "GET", url, label=self.label, proxy=self.proxy, timeout=BILLING_TIMEOUT,
+                        on_error=billing_error, headers=headers)
+
+        resp = await with_retries(request)
+        data = json_body(resp, self.label)
+        meta = data.get("ResponseMetadata") if isinstance(data.get("ResponseMetadata"), dict) else {}
+        if isinstance(meta.get("Error"), dict):
+            raise billing_error(self.label, resp.status_code, data, resp.headers)
+        result = data.get("Result") if isinstance(data.get("Result"), dict) else {}
+        # 没有返回可用余额（或为 null）时报错，不能显示成 0
+        if not as_str(result.get("AvailableBalance")):
+            raise DrawError(f"{self.label} 余额查询返回的数据格式异常")
+        currency = as_str(result.get("Currency")).upper()
+        unit = _CURRENCY_UNIT.get(currency, currency or cfg["unit"])
+        items = [("可用余额", _money(result.get("AvailableBalance"), unit))]
+        if as_str(result.get("CashBalance")):
+            items.append(("现金余额", _money(result.get("CashBalance"), unit)))
+        for name, key in (("信控额度", "CreditLimit"), ("冻结金额", "FreezeAmount"), ("欠费金额", "ArrearsBalance")):
+            if _nonzero(result.get(key)):
+                items.append((name, _money(result.get(key), unit)))
+        owner = f"{cfg['name']} " if cfg["name"].isascii() else cfg["name"]
+        note = (f"{owner}主账号的资金余额（可用余额 = 现金余额 − 冻结金额 + 信控额度 − 欠费金额），所有产品共用，"
+                "不是单个 API Key 的额度；代金券、资源包和方舟免费推理额度不在其中")
+        if not unit:
+            note += "；金额为账户的结算币种（BytePlus Pte. Ltd. 签约的账户为美元）"
+        return BalanceInfo(items=items, note=note)
 
     def summary(self) -> str:
         return f"{self.label} / {self.model} / 竖图 {self.size('portrait')}"

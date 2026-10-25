@@ -243,12 +243,13 @@ def test_web_api(env):
     main, config, tmp = env
     plugin, ctx = make_plugin(main, config, lambda r: httpx.Response(200, content=make_zip()))
     routes = {r[0].rsplit("/", 1)[-1]: r[1] for r in ctx.registered_web_apis}
-    assert set(routes) == {"state", "config", "test", "models", "audit", "images", "image"}
+    assert set(routes) == {"state", "config", "test", "models", "balance", "audit", "images", "image"}
     req = astrbot_stub.request
 
     async def go():
         state = await routes["state"]()
-        assert state["config"]["novelai"]["token"].endswith("1234") and "secret" not in json.dumps(state["config"])
+        assert state["config"]["novelai"]["token"].endswith("1234")
+        assert "pst-secret-token" not in json.dumps(state["config"])  # 完整的 Token 不能出现在页面数据中
         assert [b["key"] for b in state["backends"]][0] == "novelai"
         # 保存：掩码保持原值，修改并发数
         req.body = {"config": {"novelai": {"token": state["config"]["novelai"]["token"]},
@@ -536,3 +537,268 @@ def test_test_endpoint_rejects_mask_with_appended_key(env):
                                  "section": {"api_key": "••••5678sk-new"}}
     out = run(routes["test"]())
     assert out["status"] == "error" and "掩码" in out["message"]
+
+
+# ---------------------------------------------------------------- 图片修改与余额
+
+
+def edit_responder(kwargs):
+    system = kwargs.get("system_prompt") or ""
+    if "image-editing" in system:
+        return json.dumps({"prompt": "Change the background to a beach. Keep the character unchanged.",
+                           "negative": "", "orientation": ""})
+    if "img2img" in system:
+        return json.dumps({"prompt": "1girl, beach, smile", "negative": "", "orientation": "", "strength": 0.45})
+    return llm_responder(kwargs)
+
+
+def image_component(data: bytes):
+    comp = astrbot_stub.Image("base64://" + base64.b64encode(data).decode())
+    comp.data, comp.path, comp.url = data, "", ""
+    return comp
+
+
+def test_edit_image_from_message_with_separate_edit_backend(env):
+    main, config, tmp = env
+    config["draw"]["edit_backend"] = "openai"
+    config["openai"]["api_key"] = "sk-test-abcdefgh"
+    seen = {}
+
+    def handler(request):
+        assert request.url.path == "/v1/images/edits"
+        seen["body"] = request.content
+        return httpx.Response(200, json={"data": [{"b64_json": base64.b64encode(real_png()).decode()}]})
+
+    plugin, ctx = make_plugin(main, config, handler, edit_responder)
+    event = astrbot_stub.AstrMessageEvent()
+    event.messages = [image_component(real_png(80, 40))]
+
+    async def go():
+        await plugin.edit_image_tool(event, "把背景换成海边")
+        await asyncio.gather(*list(plugin._tasks))
+        return (await plugin.audit.page(1, 10))[0][0]
+
+    rec = run(go())
+    assert texts(event)[1:] == ["<image>", "画好啦，满意吗？"]
+    assert b'name="image"' in seen["body"] and b"Change the background to a beach" in seen["body"]
+    assert rec["status"] == "success" and rec["mode"] == "edit" and rec["backend"] == "openai"
+    assert rec["input_images"] == 1 and rec["orientation"] == "landscape"  # 保持原图方向
+    prompt_calls = [c for c in ctx.calls if "image-editing" in (c.get("system_prompt") or "")]
+    assert prompt_calls and prompt_calls[0].get("image_urls")  # 原图一起发给了提示词 LLM
+    start = [c for c in ctx.calls if "开始动笔" in (c.get("prompt") or "")]
+    assert start and "修改对方发来的图片" in start[0]["prompt"]
+
+
+def test_edit_last_drawn_image_with_novelai_img2img(env):
+    main, config, tmp = env
+    bodies = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        bodies.append(body)
+        return httpx.Response(200, content=make_zip(real_png()))
+
+    plugin, ctx = make_plugin(main, config, handler, edit_responder)
+
+    async def go():
+        await plugin._draw_flow(astrbot_stub.AstrMessageEvent(), "画一个猫娘", "", "llm")
+        event = astrbot_stub.AstrMessageEvent()
+        await plugin.edit_image_tool(event, "把背景换成海边")  # 没有发图：修改刚才画的那张
+        await asyncio.gather(*list(plugin._tasks))
+        return event, (await plugin.audit.page(1, 10))[0][0]
+
+    event, rec = run(go())
+    assert bodies[0]["action"] == "generate" and bodies[1]["action"] == "img2img"
+    assert bodies[1]["parameters"]["strength"] == 0.45 and bodies[1]["parameters"]["image"]
+    assert rec["mode"] == "edit" and rec["status"] == "success"
+
+
+def test_edit_reports_unreadable_or_missing_images(env):
+    main, config, tmp = env
+    plugin, ctx = make_plugin(main, config, nai_ok, edit_responder)
+    broken = astrbot_stub.Image("https://multimedia.nt.qq.com.cn/download?rkey=x")
+    broken.url, broken.path = broken.file, ""
+    event = astrbot_stub.AstrMessageEvent()
+    event.messages = [broken]
+    plugin.http = type(plugin.http)(transport=httpx.MockTransport(lambda r: httpx.Response(400)))
+
+    async def go():
+        await plugin.edit_image_tool(event, "改成横图")
+        await asyncio.gather(*list(plugin._tasks))
+        empty = astrbot_stub.AstrMessageEvent(sender="2")
+        await plugin.edit_image_tool(empty, "改成横图")
+        await asyncio.gather(*list(plugin._tasks))
+        return empty
+
+    empty = run(go())
+    assert "读取失败" in texts(event)[0]
+    assert "没有找到要修改的图片" in texts(empty)[0]
+
+
+def test_balance_command_and_web(env):
+    main, config, tmp = env
+
+    def handler(request):
+        assert request.url.path == "/user/subscription"
+        return httpx.Response(200, json={"tier": 3, "active": True, "trainingStepsLeft": {
+            "fixedTrainingStepsLeft": 10000, "purchasedTrainingSteps": 500}})
+
+    plugin, ctx = make_plugin(main, config, handler)
+
+    async def collect(agen):
+        return [r async for r in agen]
+
+    admin = astrbot_stub.AstrMessageEvent(sender="10001")
+    text = run(collect(plugin.draw_balance(admin, "")))[0][0].text
+    assert "【NovelAI】" in text and "10500" in text
+    text = run(collect(plugin.draw_balance(admin, "gemini")))[0][0].text
+    assert "【Gemini" in text and "aistudio.google.com" in text
+    assert "权限不足" in run(collect(plugin.draw_balance(astrbot_stub.AstrMessageEvent(sender="9"), "")))[0][0].text
+
+    routes = {r[0].rsplit("/", 1)[-1]: r[1] for r in ctx.registered_web_apis}
+    astrbot_stub.request.body = {"backend": "novelai"}
+    out = run(routes["balance"]())
+    assert any("10500" in v for _, v in out["items"])
+    astrbot_stub.request.body = {"backend": "gemini"}
+    assert run(routes["balance"]())["status"] == "error"
+
+
+def test_web_test_endpoint_edit(env):
+    main, config, tmp = env
+    config["openai"]["api_key"] = "sk-test-abcdefgh"
+
+    def handler(request):
+        assert request.url.path == "/v1/images/edits"
+        return httpx.Response(200, json={"data": [{"b64_json": base64.b64encode(real_png()).decode()}]})
+
+    plugin, ctx = make_plugin(main, config, handler)
+    routes = {r[0].rsplit("/", 1)[-1]: r[1] for r in ctx.registered_web_apis}
+    data_url = "data:image/png;base64," + base64.b64encode(real_png(40, 80)).decode()
+    astrbot_stub.request.body = {"backend": "openai", "prompt": "make it night", "images": [data_url],
+                                 "orientation": ""}
+    out = run(routes["test"]())
+    assert out["image"].startswith("data:image/") and out["params"]["mode"] == "edit"
+    astrbot_stub.request.body = {"backend": "openai", "prompt": "x", "images": [data_url] * 17}
+    assert run(routes["test"]())["status"] == "error"
+
+
+# ---------------------------------------------------------------- v1.1 审查后补充的回归测试
+
+
+def test_image_read_timeout_never_edits_last_drawing(env):
+    main, config, tmp = env
+    actions = []
+
+    def handler(request):
+        actions.append(json.loads(request.content)["action"])
+        return httpx.Response(200, content=make_zip(real_png()))
+
+    plugin, ctx = make_plugin(main, config, handler, edit_responder)
+
+    async def slow(request):
+        await asyncio.sleep(5)
+        return httpx.Response(200, content=real_png())
+
+    async def go():
+        await plugin._draw_flow(astrbot_stub.AstrMessageEvent(), "画一个猫娘", "", "llm")
+        main.IMAGE_FETCH_TIMEOUT = 0.2
+        plugin.http = type(plugin.http)(transport=httpx.MockTransport(slow))
+        stalled = astrbot_stub.Image("https://multimedia.nt.qq.com.cn/download?rkey=x")
+        stalled.url, stalled.path = stalled.file, ""
+        event = astrbot_stub.AstrMessageEvent()
+        event.messages = [stalled]
+        await plugin.edit_image_tool(event, "把背景换成海边")
+        await asyncio.gather(*list(plugin._tasks))
+        return event
+
+    event = run(go())
+    assert actions == ["generate"]  # 没有去修改上一张画
+    assert "重新发送" in texts(event)[0]
+
+
+def test_edit_uses_image_from_users_previous_message(env):
+    main, config, tmp = env
+    bodies = []
+
+    def handler(request):
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, content=make_zip(real_png()))
+
+    plugin, ctx = make_plugin(main, config, handler, edit_responder)
+    photo = real_png(120, 60)
+
+    async def go():
+        # 用户先单独发了一张图（没有唤醒 Bot，只被监听器记下），再发文字要求修改
+        sent = astrbot_stub.AstrMessageEvent(sender="42")
+        sent.messages = [image_component(photo)]
+        await plugin.remember_user_images(sent)
+        ask = astrbot_stub.AstrMessageEvent(sender="42")
+        await plugin.edit_image_tool(ask, "把它改成夏天")
+        await asyncio.gather(*list(plugin._tasks))
+
+    run(go())
+    assert bodies and bodies[-1]["action"] == "img2img"
+    assert bodies[-1]["parameters"]["width"] > bodies[-1]["parameters"]["height"]  # 用的是用户发的横图
+
+
+def test_unresolved_quote_is_not_replaced_by_last_drawing(env):
+    main, config, tmp = env
+    actions = []
+
+    def handler(request):
+        actions.append(json.loads(request.content)["action"])
+        return httpx.Response(200, content=make_zip(real_png()))
+
+    plugin, ctx = make_plugin(main, config, handler, edit_responder)
+
+    async def go():
+        await plugin._draw_flow(astrbot_stub.AstrMessageEvent(), "画一个猫娘", "", "llm")
+        reply = astrbot_stub.Reply([])  # 平台没能取到被引用的消息
+        reply.id = "999"
+        event = astrbot_stub.AstrMessageEvent(platform="discord")
+        event.messages = [reply]
+        event.get_self_id = lambda: "bot"
+        await plugin.edit_image_tool(event, "改成夏天")
+        await asyncio.gather(*list(plugin._tasks))
+        return event
+
+    event = run(go())
+    assert actions == ["generate"] and "重新发送" in texts(event)[0]
+
+
+def test_tag_edit_keeps_source_orientation(env):
+    main, config, tmp = env
+    bodies = []
+
+    def handler(request):
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, content=make_zip(real_png()))
+
+    def responder(kwargs):
+        if "img2img" in (kwargs.get("system_prompt") or ""):
+            # LLM 不听话地给了一个方向
+            return json.dumps({"prompt": "1girl, beach", "negative": "", "orientation": "portrait", "strength": 0.5})
+        return llm_responder(kwargs)
+
+    plugin, ctx = make_plugin(main, config, handler, responder)
+    event = astrbot_stub.AstrMessageEvent()
+    event.messages = [image_component(real_png(160, 90))]
+
+    async def go():
+        await plugin.edit_image_tool(event, "把背景换成海边")
+        await asyncio.gather(*list(plugin._tasks))
+
+    run(go())
+    params = bodies[-1]["parameters"]
+    assert params["width"] > params["height"]  # 保持原图的横向比例，没有被裁成竖图
+    tag_prompt = [c["system_prompt"] for c in ctx.calls if "img2img" in (c.get("system_prompt") or "")][0]
+    assert 'Rules for "orientation"' not in tag_prompt
+
+
+def test_state_reports_edit_prompt_mode(env):
+    main, config, tmp = env
+    config["comfyui"]["edit_prompt_mode"] = "natural"
+    plugin, ctx = make_plugin(main, config, nai_ok)
+    routes = {r[0].rsplit("/", 1)[-1]: r[1] for r in ctx.registered_web_apis}
+    comfy = next(b for b in run(routes["state"]())["backends"] if b["key"] == "comfyui")
+    assert comfy["prompt_mode"] == "tags" and comfy["edit_prompt_mode"] == "natural"

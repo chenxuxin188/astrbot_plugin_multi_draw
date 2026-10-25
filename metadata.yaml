@@ -1,7 +1,7 @@
 name: astrbot_plugin_multi_draw
 display_name: 多平台绘图
-desc: 让 Bot 借助 LLM 在聊天中画画，支持 NovelAI、OpenAI、Seedream、xAI、Gemini、SenseNova 和 ComfyUI；开画、完成、失败时都会按人格说话，并提供可视化配置页面
-version: v1.0.0
+desc: 让 Bot 借助 LLM 在聊天中画画、改图，支持 NovelAI、OpenAI、Seedream、xAI、Gemini、SenseNova 和 ComfyUI；开画、完成、失败时都会按人格说话，可查询各平台余额，并提供可视化配置页面
+version: v1.1.0
 author: NyaNyaDance
 repo: https://github.com/chenxuxin188/astrbot_plugin_multi_draw
 support_platforms:

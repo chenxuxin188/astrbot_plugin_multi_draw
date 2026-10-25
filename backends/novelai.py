@@ -1,16 +1,21 @@
-"""NovelAI 后端：官方 API 的精简客户端（生成图片 / 查询订阅与 Anlas）。
+"""NovelAI 后端：官方 API 的精简客户端（生成图片 / 图生图修改图片 / 查询订阅与 Anlas）。
 
 本模块只依赖标准库与 httpx，不依赖 AstrBot，便于单独测试。
+例外：修改图片时需要把底图缩放成恰好的请求尺寸，标准库无法解码 JPEG，
+因此在 prepare_init_image() 中延迟导入 Pillow（AstrBot 自带），不可用时给出可读的错误。
 """
 
 import asyncio
+import base64
+import dataclasses
 import html
+import importlib.util
 import io
 import math
 import random
 import re
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 import httpx
@@ -18,16 +23,20 @@ import httpx
 from .base import (
     MAX_DIMENSION,
     Backend,
+    BalanceInfo,
     Clients,
     DrawError,
     DrawRequest,
     DrawResult,
+    InputImage,
     as_bool,
     as_float,
     as_int,
     as_str,
+    image_orientation,
     image_result,
     is_local_url,
+    with_retries,
 )
 
 DEFAULT_BASE_URL = "https://image.novelai.net"
@@ -42,6 +51,20 @@ OPUS_FREE_MAX_STEPS = 28
 MAX_SEED = 4294967295 - 7
 
 TIER_NAMES = {0: "Paper", 1: "Tablet", 2: "Scroll", 3: "Opus"}
+
+# 图生图（action "img2img"）：官方网页端默认 strength 0.7、noise 0，滑块范围 0.01-0.99 / 0-0.99
+EDIT_DEFAULT_STRENGTH = 0.7
+EDIT_MIN_STRENGTH = 0.01
+EDIT_MAX_STRENGTH = 0.99
+EDIT_DEFAULT_NOISE = 0.0
+EDIT_MAX_NOISE = 0.99
+# 官方网页端 validateParameters：宽 × 高 ≤ 3145728，步数 ≤ 50；尺寸是 64 的倍数
+NAI_MAX_PIXELS = 3145728
+SIZE_MULTIPLE = 64
+# 底图宽高比限制在 1:4 ~ 4:1（官方只限制总像素，单边上限未公开）；超出时居中裁剪，避免极端长边
+EDIT_MAX_ASPECT = 4.0
+# 底图与目标尺寸的宽高比（取对数）相差不超过该值时直接拉伸（与网页端一致），超过时先居中裁剪
+ASPECT_TOLERANCE = 0.03
 
 
 class NovelAIError(DrawError):
@@ -70,6 +93,75 @@ class ImageRequest:
     sampler: str
     noise_schedule: str
     seed: int = 0
+    # 图生图的底图：为 None 时是文生图。发送前必须是恰好 width × height 的 PNG（见 prepare_init_image）
+    image: bytes | None = field(default=None, repr=False)
+    strength: float = EDIT_DEFAULT_STRENGTH
+    noise: float = EDIT_DEFAULT_NOISE
+    # 用户提供的图片数；NovelAI 只使用第一张，其余的忽略
+    input_images: int = 0
+
+
+def edit_size(src_width: int, src_height: int, budget_pixels: int) -> tuple[int, int]:
+    """图生图的输出尺寸：接近原图宽高比（限制在 1:4 ~ 4:1），宽 × 高 ≤ budget_pixels，宽高都是 64 的倍数。
+
+    NovelAI 没有"跟随原图"的尺寸选项，输出尺寸就是请求里的 width × height。
+    """
+    m = SIZE_MULTIPLE
+    budget = max(m * m, min(int(budget_pixels), NAI_MAX_PIXELS))
+    ratio = min(max(src_width / src_height, 1 / EDIT_MAX_ASPECT), EDIT_MAX_ASPECT)
+    target = math.log(ratio)
+    best, best_key = (m, m), None
+    # 逐个尝试 64 倍数的宽度（最多约 60 个），每个宽度取最接近目标比例的几个高度
+    # （高度超过约 2100 时 3% 的容差能容纳两个 64 的台阶，所以多试一个 h0 + 2m）
+    for w in range(m, int(math.sqrt(budget * EDIT_MAX_ASPECT)) + 2 * m, m):
+        h_max = budget // w // m * m
+        if h_max < m:
+            break
+        h0 = int(w / ratio) // m * m
+        for h in {max(m, min(h0, h_max)), min(h0 + m, h_max), min(h0 + 2 * m, h_max)}:
+            # 宽高比相差 3% 以内的候选取面积最大的；都超出时取宽高比最接近的
+            key = (max(0.0, abs(math.log(w / h) - target) - ASPECT_TOLERANCE), -w * h)
+            if best_key is None or key < best_key:
+                best, best_key = (w, h), key
+    return best
+
+
+def prepare_init_image(data: bytes, width: int, height: int, keep_alpha: bool) -> bytes:
+    """按官方网页端（fillImageBackground）的做法整理底图：缩放（Lanczos）到恰好 width × height，
+    不支持透明图的模型（V5 以外）把透明背景铺成白色，编码为 PNG。
+    宽高比相差超过 3% 时先居中裁剪，避免画面变形。
+    """
+    try:
+        from PIL import Image
+    except ImportError as e:
+        raise NovelAIError("NovelAI 修改图片需要 Pillow 来调整原图尺寸，请在 AstrBot 环境中安装 Pillow") from e
+    try:
+        with Image.open(io.BytesIO(data)) as im:
+            im.seek(0)
+            im.load()
+            has_alpha = im.mode in ("RGBA", "LA", "PA") or (im.mode == "P" and "transparency" in im.info)
+            im = im.convert("RGBA" if has_alpha else "RGB")
+            src_ratio, dst_ratio = im.width / im.height, width / height
+            if abs(math.log(src_ratio / dst_ratio)) > ASPECT_TOLERANCE:
+                if src_ratio > dst_ratio:
+                    crop_w = max(1, round(im.height * dst_ratio))
+                    left = (im.width - crop_w) // 2
+                    im = im.crop((left, 0, left + crop_w, im.height))
+                else:
+                    crop_h = max(1, round(im.width / dst_ratio))
+                    top = (im.height - crop_h) // 2
+                    im = im.crop((0, top, im.width, top + crop_h))
+            if im.size != (width, height):
+                lanczos = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+                im = im.resize((width, height), lanczos)
+            if has_alpha and not keep_alpha:
+                canvas = Image.new("RGBA", im.size, (255, 255, 255, 255))
+                im = Image.alpha_composite(canvas, im).convert("RGB")
+            buf = io.BytesIO()
+            im.save(buf, "PNG")
+            return buf.getvalue()
+    except Exception as e:
+        raise NovelAIError(f"无法读取要修改的图片（{type(e).__name__}）") from e
 
 
 def normalize_base_url(url: str) -> str:
@@ -179,7 +271,30 @@ def build_payload(req: ImageRequest) -> dict:
     if req.sampler == "k_euler_ancestral":
         params["deliberate_euler_ancestral_bug"] = False
         params["prefer_brownian"] = True
-    return {"input": req.prompt, "model": req.model, "action": "generate", "parameters": params}
+    action = "generate"
+    if req.image is not None:
+        # 与官方网页端一致：action 为 img2img，底图是不带 data: 前缀的 base64 PNG，
+        # strength / noise 放在 parameters 顶层（嵌套的 parameters.img2img 只用于局部重绘 infill），
+        # 图生图关闭 SMEA，extra_noise_seed 默认取 seed - 1，color_correct 为 False。
+        action = "img2img"
+        params.update({
+            "image": base64.b64encode(req.image).decode("ascii"),
+            "strength": clamp_strength(req.strength),
+            "noise": round(as_float(req.noise, EDIT_DEFAULT_NOISE, 0.0, EDIT_MAX_NOISE), 2),
+            "extra_noise_seed": seed - 1 if seed > 1 else seed + 1,
+            "color_correct": False,
+            "sm": False,
+            "sm_dyn": False,
+        })
+    return {"input": req.prompt, "model": req.model, "action": action, "parameters": params}
+
+
+def clamp_strength(value: object) -> float:
+    """重绘幅度：0 或无效值使用官方默认 0.7，其余限制在 0.01-0.99（官方网页端滑块范围）。"""
+    strength = as_float(value, 0.0)
+    if strength <= 0:
+        strength = EDIT_DEFAULT_STRENGTH
+    return round(min(max(strength, EDIT_MIN_STRENGTH), EDIT_MAX_STRENGTH), 2)
 
 
 def extract_image(body: bytes) -> bytes:
@@ -203,6 +318,7 @@ _STATUS_TEXT = {
     403: "请求被拒绝（可能是网络或地区限制）",
     404: "接口地址不存在，请检查 base_url",
     409: "账户正在进行其它生成",
+    413: "请求内容过大（原图太大）",
     429: "账户正在进行其它生成或请求过于频繁",
 }
 
@@ -221,7 +337,8 @@ def error_from_response(status: int, body: object) -> NovelAIError:
         if detail.lstrip().startswith("<") or "<html" in detail[:1000].lower():
             match = _TITLE_RE.search(detail)
             detail = html.unescape(match.group(1)) if match else ""
-    detail = " ".join(detail.split())[:200]
+    # 接口仍沿用旧名 training steps 表示 Anlas（官方网页端同样替换后展示）
+    detail = re.sub(r"training steps", "Anlas", " ".join(detail.split()), flags=re.I)[:200]
     if status >= 500:
         text = "NovelAI 服务器错误"
     else:
@@ -248,6 +365,53 @@ def anlas_total(subscription: dict) -> int | None:
 
 def tier_name(tier: object) -> str:
     return TIER_NAMES.get(tier, str(tier)) if isinstance(tier, int) else "未知"
+
+
+def _format_wait(seconds: float) -> str:
+    minutes = max(1, round(seconds / 60))
+    return f"{minutes} 分钟" if minutes < 120 else f"{minutes / 60:.1f} 小时"
+
+
+def balance_info(data: dict) -> BalanceInfo:
+    """把 GET /user/subscription 的结果整理成余额信息。
+
+    trainingStepsLeft 就是 Anlas（接口沿用旧名 training steps）：fixedTrainingStepsLeft 为订阅 Anlas
+    （续订时补满，订阅结束清零），purchasedTrainingSteps 为购买的 Anlas（不过期）。
+    usage 是 Opus 的 V5 用量条：percent 是剩余百分比，purchasedPercent 是另外购买的额外用量
+    （不含在 percent 里），isNegative 为 True 时 V5 改扣 Anlas。expiresAt 是秒级时间戳。
+    """
+    tier, active = data.get("tier"), bool(data.get("active"))
+    status = "有效" if active else "未激活"
+    expiry = format_expiry(data.get("expiresAt"))
+    if active and expiry:
+        status += f"，{expiry} 到期"
+    items = [("订阅", f"{tier_name(tier)}（{status}）")]
+    steps = data.get("trainingStepsLeft") if isinstance(data.get("trainingStepsLeft"), dict) else {}
+    total = anlas_total(data)
+    if total is not None:
+        items.append(("Anlas", f"{total}（订阅 {steps['fixedTrainingStepsLeft']} + 购买 {steps['purchasedTrainingSteps']}）"))
+    else:
+        items.append(("Anlas", "未知（接口没有返回 Anlas 余额）"))
+    usage = data.get("usage")
+    # 官方网页端只对有效的 Opus（tier >= 3）订阅显示用量条
+    if (isinstance(tier, int) and tier >= 3 and active and isinstance(usage, dict)
+            and isinstance(usage.get("percent"), (int, float)) and not isinstance(usage.get("percent"), bool)):
+        if usage.get("isNegative"):
+            text = "已用尽（V5 改扣 Anlas，恢复后重新免费）"
+        else:
+            # 与网页端 usageDisplayPercent 一致：最多显示 100%
+            text = f"剩余 {min(100, max(0, int(usage['percent'])))}%"
+        extra = usage.get("purchasedPercent")
+        if isinstance(extra, (int, float)) and extra > 0:
+            text += f"，额外用量 +{int(extra)}%"
+        wait = usage.get("timeUntilNextPercent")
+        if isinstance(wait, (int, float)) and wait > 0:
+            text += f"，约 {_format_wait(wait)}后恢复 1%"
+        elif wait == 0 and not usage.get("isNegative") and usage["percent"] >= 100:
+            # timeUntilNextPercent 为 0 表示用量超过 100%，暂停恢复
+            text += "（超过 100% 时暂停恢复）"
+        items.append(("V5 用量条", text))
+    return BalanceInfo(items=items)
 
 
 def format_expiry(value: object) -> str:
@@ -410,6 +574,12 @@ class NovelAIBackend(Backend):
     # 同一个 NovelAI 账号同时只能生成一张图
     max_concurrency = 1
     doc_url = "https://docs.novelai.net/"
+    # 图生图只接受一张底图（parameters.image 是单个字符串）；除局部重绘专用模型外所有模型都支持
+    max_edit_images = 1
+    supports_strength = True
+    # 余额（订阅、Anlas、V5 用量条）用同一个 Persistent API Token 查询 /user/subscription
+    supports_balance = True
+    billing_url = "https://novelai.net/image"
 
     @property
     def token(self) -> str:
@@ -447,11 +617,50 @@ class NovelAIBackend(Backend):
         width, height = parse_size(text, parse_size(default))
         return fit_size(width, height, free_guard=self.free_guard)
 
+    @property
+    def edit_noise(self) -> float:
+        return as_float(self.section.get("edit_noise"), EDIT_DEFAULT_NOISE, 0.0, EDIT_MAX_NOISE)
+
     def missing(self) -> str:
         return "" if self.token else "管理员还没有配置 NovelAI Token"
 
+    def edit_missing(self) -> str:
+        reason = super().edit_missing()
+        if reason:
+            return reason
+        # *-inpainting 模型只用于局部重绘（action infill，需要遮罩），不能做整图图生图
+        if self.model.endswith("-inpainting"):
+            return f"当前模型 {self.model} 是局部重绘专用模型，不支持修改图片，请换成对应的普通模型"
+        if importlib.util.find_spec("PIL") is None:
+            return "NovelAI 修改图片需要 Pillow 来调整原图尺寸，当前环境没有安装 Pillow"
+        return ""
+
+    def edit_target_size(self, req: DrawRequest, image: InputImage) -> tuple[int, int]:
+        """图生图的输出尺寸（底图会被缩放成这个尺寸）。
+
+        方向与原图一致时（用户没有要求改方向）保持原图宽高比，像素数不超过该方向配置的尺寸
+        （开启免费参数保护时 ≤ 1024×1024，否则 ≤ 官方上限 3145728）；
+        用户要求改成其它方向、或不知道原图尺寸时使用该方向配置的尺寸，原图居中裁剪。
+        """
+        source = image_orientation(image)
+        orientation = req.orientation if req.orientation in DEFAULT_SIZES else (source or "portrait")
+        width, height = self.size(orientation)
+        if source and source == orientation:
+            return edit_size(image.width, image.height, width * height)
+        if width * height > NAI_MAX_PIXELS:
+            return edit_size(width, height, NAI_MAX_PIXELS)
+        return width, height
+
     def build_request(self, req: DrawRequest) -> ImageRequest:
         width, height = self.size(req.orientation)
+        edit: dict = {}
+        if req.is_edit:
+            # NovelAI 只接受一张底图，多余的图片忽略（记录在参数 ignored_images 中）
+            source = req.images[0]
+            width, height = self.edit_target_size(req, source)
+            # 原图在 generate() 中再缩放成 width × height 的 PNG，plan() 不做图片处理
+            edit = dict(image=source.data, strength=clamp_strength(req.strength), noise=self.edit_noise,
+                        input_images=len(req.images))
         return ImageRequest(
             model=self.model,
             prompt=req.prompt,
@@ -464,6 +673,7 @@ class NovelAIBackend(Backend):
             sampler=as_str(self.section.get("sampler")) or "k_euler_ancestral",
             noise_schedule=as_str(self.section.get("noise_schedule")) or "karras",
             seed=req.seed if 0 < req.seed <= MAX_SEED else random_seed(),
+            **edit,
         )
 
     def _image_request(self, req: DrawRequest) -> ImageRequest:
@@ -475,7 +685,7 @@ class NovelAIBackend(Backend):
 
     @staticmethod
     def _params(image_req: ImageRequest) -> dict:
-        return {
+        params = {
             "model": image_req.model,
             "size": f"{image_req.width}x{image_req.height}",
             "steps": image_req.steps,
@@ -484,19 +694,58 @@ class NovelAIBackend(Backend):
             "seed": image_req.seed,
             "opus_free": is_opus_free(image_req.model, image_req.width, image_req.height, image_req.steps),
         }
+        if image_req.image is not None:
+            # 官方订阅说明：有底图的生成不在 Opus 免费范围内；官方网页端的计价却不排除底图。
+            # 两者冲突，这里保守地记为"可能消耗 Anlas"，实际是否扣费以前后余额差（anlas_cost）为准
+            params.update(mode="edit", input_images=1, strength=clamp_strength(image_req.strength),
+                          noise=round(image_req.noise, 2), opus_free=False)
+            if image_req.input_images > 1:
+                params["ignored_images"] = image_req.input_images - 1
+        return params
 
     def plan(self, req: DrawRequest) -> dict:
         return self._params(self._image_request(req))
 
+    @staticmethod
+    def _client(clients: Clients) -> "NovelAIClient":
+        if clients.novelai is None:
+            raise NovelAIError("NovelAI 客户端未初始化（插件可能正在重载），请稍后再试")
+        return clients.novelai
+
     async def generate(self, clients: Clients, req: DrawRequest) -> DrawResult:
         image_req = self._image_request(req)
-        image = await clients.novelai.generate(
-            image_req, token=self.token, base_url=self.base_url, proxy=self.proxy, timeout=self.timeout
-        )
+        send_req = image_req
+        if image_req.image is not None:
+            reason = self.edit_missing()
+            if reason:
+                raise NovelAIError(reason)
+            # 官方网页端发送前把底图缩放到恰好 width × height；V5 支持透明图，保留透明通道
+            png = await asyncio.to_thread(
+                prepare_init_image, image_req.image, image_req.width, image_req.height,
+                is_v5_model(image_req.model),
+            )
+            send_req = dataclasses.replace(image_req, image=png)
+        try:
+            image = await self._client(clients).generate(
+                send_req, token=self.token, base_url=self.base_url, proxy=self.proxy, timeout=self.timeout
+            )
+        except NovelAIError as e:
+            if image_req.image is not None and e.status == 402:
+                raise NovelAIError(f"{e}。修改图片（图生图）可能不在 Opus 免费出图范围内，需要消耗 Anlas",
+                                   status=e.status) from e
+            raise
         return image_result(image, self._params(image_req))
 
     async def subscription(self, clients: Clients) -> dict:
-        return await clients.novelai.subscription(token=self.token, base_url=self.base_url, proxy=self.proxy)
+        return await self._client(clients).subscription(token=self.token, base_url=self.base_url, proxy=self.proxy)
+
+    async def balance(self, clients: Clients) -> BalanceInfo:
+        reason = self.balance_missing()
+        if reason:
+            raise NovelAIError(reason)
+        # GET 查询可以安全重试（只在连接失败、并发锁定等 retryable 错误时重试一次）
+        data = await with_retries(lambda: self.subscription(clients))
+        return balance_info(data)
 
     def summary(self) -> str:
         width, height = self.size("portrait")

@@ -12,16 +12,24 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from backends import base as base_mod  # noqa: E402
-from backends.base import Clients, DrawError, DrawRequest, HttpPool  # noqa: E402
+from backends import gemini as gemini_mod  # noqa: E402
+from backends.base import Clients, DrawError, DrawRequest, HttpPool, InputImage  # noqa: E402
 from backends.gemini import (  # noqa: E402
+    BILLING_URL,
     DEFAULT_BASE_URL,
     DEFAULT_MODEL,
     DEFAULT_SIZES,
     DEFAULT_TIMEOUT,
+    MAX_EDIT_IMAGES,
     MODEL_CAPS,
     RATIOS,
+    SPEND_URL,
+    USAGE_URL,
+    Caps,
     GeminiBackend,
+    encode_inputs,
     gemini_base_url,
+    gemini_error,
 )
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
@@ -94,13 +102,16 @@ def section(**kw) -> dict:
     return {"api_key": KEY, **kw}
 
 
-def run(backend: GeminiBackend, handler, req: DrawRequest | None = None, *, models: bool = False):
+def run(backend: GeminiBackend, handler, req: DrawRequest | None = None, *, models: bool = False,
+        balance: bool = False):
     async def main():
         pool = HttpPool(transport=httpx.MockTransport(handler))
         try:
             clients = Clients(http=pool)
             if models:
                 return await backend.list_models(clients)
+            if balance:
+                return await backend.balance(clients)
             return await backend.generate(clients, req or DrawRequest("a cat"))
         finally:
             await pool.close()
@@ -822,3 +833,439 @@ def test_schema_defaults_produce_valid_request(api, orientation):
         assert_valid_gc_body(rec.body(), DEFAULT_MODEL)
         assert rec.body()["generationConfig"]["imageConfig"] == {"aspectRatio": DEFAULT_SIZES[orientation]}
     assert DEFAULT_SIZES[orientation] in RATIOS
+
+
+# ---------------------------------------------------------------- 修改图片
+
+
+WEBP = b"RIFF\x00\x00\x00\x00WEBPVP8 " + b"\x00" * 8
+GIF = b"GIF89a" + b"\x00" * 16
+
+
+def png_in(width: int = 900, height: int = 1200, mime: str = "image/png") -> InputImage:
+    return InputImage(PNG, mime, width, height)
+
+
+def jpeg_in(width: int = 900, height: int = 1200, mime: str = "image/jpeg") -> InputImage:
+    return InputImage(JPEG, mime, width, height)
+
+
+def b64(data: bytes) -> str:
+    return base64.b64encode(data).decode()
+
+
+def edit_req(*images: InputImage, prompt: str = "make the sky red", orientation: str = "portrait",
+             **kw) -> DrawRequest:
+    return DrawRequest(prompt, orientation=orientation, images=list(images or (png_in(),)), **kw)
+
+
+def test_edit_class_attributes():
+    assert GeminiBackend.max_edit_images == MAX_EDIT_IMAGES == 14
+    assert GeminiBackend.supports_strength is False and GeminiBackend.supports_balance is False
+    assert GeminiBackend.billing_url == BILLING_URL == "https://aistudio.google.com/billing"
+    # 每个已知模型都能修改图片，不超过类上声明的最大值
+    for model, caps in MODEL_CAPS.items():
+        backend = GeminiBackend(section(model=model))
+        assert backend.edit_missing() == "", model
+        assert 0 < backend.edit_limit == caps.edit_images <= GeminiBackend.max_edit_images, model
+    assert GeminiBackend(section(model="gemini-2.5-flash-image")).edit_limit == 3
+    assert GeminiBackend(section(model="gemini-3-pro-image-001")).edit_limit == 14  # 版本后缀
+    assert GeminiBackend(section(model="some-relay-alias")).edit_limit == 14  # 未知模型
+    assert GeminiBackend({}).edit_missing() == ""
+
+
+@pytest.mark.parametrize(("model", "limit"), [*((m, c.edit_images) for m, c in MODEL_CAPS.items()),
+                                              ("gemini-2.5-flash-image-preview", 14),  # 换成替代模型
+                                              ("some-relay-alias", 14)])
+def test_edit_instance_limit_follows_model(model, limit):
+    """插件收集图片、网页试画限制图片数都读实例上的 max_edit_images：要按当前模型给出，不能超过类上的最大值。"""
+    backend = GeminiBackend(section(model=model))
+    assert backend.max_edit_images == backend.edit_limit == limit <= GeminiBackend.max_edit_images
+    assert GeminiBackend.max_edit_images == MAX_EDIT_IMAGES  # 类属性不受实例影响
+    assert GeminiBackend(None).max_edit_images == MAX_EDIT_IMAGES
+
+
+def test_edit_generate_content_request_shape():
+    rec = Recorder(gc_ok({"text": "Here it is"}, {"inlineData": {"mimeType": "image/jpeg", "data": b64(JPEG)}}))
+    req = edit_req(png_in(900, 1200), jpeg_in(100, 100, mime="image/jpg"), seed=9)
+    result = run(GeminiBackend(section()), rec, req)
+    assert len(rec.requests) == 1
+    request = rec.requests[0]
+    assert request.method == "POST" and str(request.url) == GC_URL
+    assert request.headers["content-type"] == "application/json"
+    assert request.headers["x-goog-api-key"] == KEY and "key=" not in str(request.url)
+    # 文字在前，图片按用户顺序在后；MIME 按文件头识别（image/jpg → image/jpeg）；base64 不带 data: 前缀
+    assert rec.body() == {
+        "contents": [{"role": "user", "parts": [
+            {"text": "make the sky red"},
+            {"inlineData": {"mimeType": "image/png", "data": b64(PNG)}},
+            {"inlineData": {"mimeType": "image/jpeg", "data": b64(JPEG)}},
+        ]}],
+        "generationConfig": {"responseModalities": ["TEXT", "IMAGE"], "imageConfig": {"aspectRatio": "3:4"},
+                             "seed": 9},
+    }
+    assert result.image == JPEG and result.mime == "image/jpeg" and result.text == "Here it is"
+    assert result.params == {"model": DEFAULT_MODEL, "size": "3:4", "aspect_ratio": "3:4", "api": "generateContent",
+                             "mode": "edit", "input_images": 2, "seed": 9}
+
+
+@pytest.mark.parametrize(
+    ("model", "width", "height", "orientation", "extra", "image_config"),
+    [
+        (DEFAULT_MODEL, 900, 1200, "portrait", {}, {"aspectRatio": "3:4"}),  # 保持原图比例而不是配置的 2:3
+        (DEFAULT_MODEL, 300, 1200, "portrait", {}, {"aspectRatio": "1:4"}),
+        ("gemini-3-pro-image", 300, 1200, "portrait", {}, {"aspectRatio": "9:16"}),  # pro 没有 1:4
+        (DEFAULT_MODEL, 1920, 1080, "landscape", {"image_size": "2K"}, {"aspectRatio": "16:9", "imageSize": "2K"}),
+        (DEFAULT_MODEL, 1000, 1000, "square", {}, {"aspectRatio": "1:1"}),
+        (DEFAULT_MODEL, 2048, 1800, "square", {}, {"aspectRatio": "5:4"}),  # 接近方图时也取最接近原图的比例
+        # 用户要求换方向时用配置的比例
+        (DEFAULT_MODEL, 900, 1200, "landscape", {"landscape_size": "16:9"}, {"aspectRatio": "16:9"}),
+        (DEFAULT_MODEL, 1920, 1080, "portrait", {}, {"aspectRatio": "2:3"}),
+        ("gemini-2.5-flash-image", 1080, 1920, "portrait", {"image_size": "4K"}, {"aspectRatio": "9:16"}),
+    ],
+)
+def test_edit_keeps_input_aspect_ratio(model, width, height, orientation, extra, image_config):
+    rec = Recorder(gc_ok())
+    backend = GeminiBackend(section(model=model, **extra))
+    result = run(backend, rec, edit_req(png_in(width, height), orientation=orientation))
+    config = rec.body()["generationConfig"]
+    assert config["imageConfig"] == image_config
+    assert image_config["aspectRatio"] in MODEL_CAPS[model].ratios
+    assert result.params["aspect_ratio"] == image_config["aspectRatio"]
+    assert result.params["size"] == " ".join(filter(None, [image_config["aspectRatio"],
+                                                           image_config.get("imageSize")]))
+    # 记录中预计的尺寸与实际发送的一致
+    plan = backend.plan(edit_req(png_in(width, height), orientation=orientation))
+    assert plan == {"model": model, "size": result.params["size"], "mode": "edit", "input_images": 1}
+
+
+def test_edit_unknown_input_size_follows_reference_image():
+    """不知道原图尺寸时不发送宽高比，由接口按参考图决定；没有档位时不发送空的 imageConfig。"""
+    rec = Recorder(gc_ok())
+    result = run(GeminiBackend(section(model="gemini-2.5-flash-image")), rec, edit_req(png_in(0, 0)))
+    assert rec.body()["generationConfig"] == {"responseModalities": ["TEXT", "IMAGE"]}
+    assert result.params["size"] == "跟随原图" and result.params["aspect_ratio"] == "auto"
+
+    rec = Recorder(gc_ok())
+    result = run(GeminiBackend(section(image_size="2K")), rec, edit_req(png_in(0, 0)))
+    assert rec.body()["generationConfig"]["imageConfig"] == {"imageSize": "2K"}
+    assert result.params["size"] == "跟随原图 2K"
+
+    rec = Recorder(ia_ok())
+    run(GeminiBackend(section(api="interactions")), rec, edit_req(png_in(0, 0)))
+    assert rec.body()["response_format"] == {"type": "image"}
+
+
+@pytest.mark.parametrize(("width", "height"), [(-900, 1200), (900, -1200), (10**400, 1), (1, 10**7),
+                                               ("abc", 1200), (None, None), (900, 0)])
+def test_edit_invalid_input_size_treated_as_unknown(width, height):
+    """尺寸无效时当作不知道尺寸（不发送宽高比），而不是在 math.log / 除法里抛出非 DrawError 的异常。"""
+    rec = Recorder(gc_ok())
+    req = edit_req(InputImage(PNG, "image/png", width, height))
+    backend = GeminiBackend(section())
+    assert backend.plan(req)["size"] == "跟随原图"
+    result = run(backend, rec, req)
+    assert "imageConfig" not in rec.body()["generationConfig"] and result.params["aspect_ratio"] == "auto"
+
+
+def test_edit_unrecognized_orientation_keeps_input_shape():
+    rec = Recorder(gc_ok())
+    result = run(GeminiBackend(section()), rec, edit_req(png_in(1920, 1080), orientation="bogus"))
+    assert rec.body()["generationConfig"]["imageConfig"] == {"aspectRatio": "16:9"}
+    assert result.params["aspect_ratio"] == "16:9"
+
+
+@pytest.mark.parametrize("api", ["generate_content", "interactions"])
+@pytest.mark.parametrize("model", list(MODEL_CAPS))
+def test_edit_every_model_family_sends_only_known_fields(model, api):
+    """每个模型、两种接口：PNG（透明）+ JPEG、奇数尺寸、极端比例、strength 都不会带出该模型不接受的值或未知字段。"""
+    caps = MODEL_CAPS[model]
+    images = [png_in(333, 1999), jpeg_in(4001, 7), png_in(1, 1)]
+    rec = Recorder(ia_ok() if api == "interactions" else gc_ok())
+    backend = GeminiBackend(section(model=model, api=api, image_size="4K", thinking_level="medium"))
+    result = run(backend, rec, edit_req(*images, strength=1.0, seed=3))
+    body = rec.body()
+    sent = min(len(images), caps.edit_images)
+    assert "strength" not in json.dumps(body) and "mask" not in json.dumps(body)
+    if api == "interactions":
+        assert set(body) == {"model", "input", "response_format", "store", "generation_config"}
+        assert body["input"][0] == {"type": "text", "text": "make the sky red"}
+        assert [p["mime_type"] for p in body["input"][1:]] == ["image/png", "image/jpeg", "image/png"][:sent]
+        assert all(set(p) == {"type", "mime_type", "data"} for p in body["input"][1:])
+        fmt = body["response_format"]
+        assert set(fmt) <= {"type", "aspect_ratio", "image_size"} and fmt["aspect_ratio"] in caps.ratios
+        assert fmt.get("image_size", "1K") in (caps.sizes or ("1K",)) and ("image_size" in fmt) == bool(caps.sizes)
+        assert body["store"] is False
+        assert set(body["generation_config"]) <= {"seed", "thinking_level"}
+        assert body["generation_config"].get("thinking_level") in (None, *caps.thinking)
+    else:
+        assert_valid_gc_body(body, model)
+        parts = body["contents"][0]["parts"]
+        assert parts[0] == {"text": "make the sky red"} and len(parts) == 1 + sent
+        assert all(set(p) == {"inlineData"} and set(p["inlineData"]) == {"mimeType", "data"} for p in parts[1:])
+        assert all(not p["inlineData"]["data"].startswith("data:") for p in parts[1:])
+    assert result.params["input_images"] == sent and result.params["mode"] == "edit"
+
+
+def test_edit_interactions_request_shape():
+    rec = Recorder(ia_ok())
+    backend = GeminiBackend(section(api="interactions", image_size="2K", thinking_level="high"))
+    req = edit_req(jpeg_in(500, 500), png_in(10, 20), prompt="swap the hat", orientation="square", negative="text")
+    result = run(backend, rec, req)
+    assert str(rec.requests[0].url) == IA_URL and rec.requests[0].headers["x-goog-api-key"] == KEY
+    assert rec.body() == {
+        "model": DEFAULT_MODEL,
+        "input": [
+            {"type": "text", "text": "swap the hat\n\nAvoid: text"},
+            {"type": "image", "mime_type": "image/jpeg", "data": b64(JPEG)},
+            {"type": "image", "mime_type": "image/png", "data": b64(PNG)},
+        ],
+        "response_format": {"type": "image", "aspect_ratio": "1:1", "image_size": "2K"},
+        "store": False,
+        "generation_config": {"thinking_level": "high"},
+    }
+    assert result.image == PNG and result.text == "done"
+    assert result.params == {"model": DEFAULT_MODEL, "size": "1:1 2K", "aspect_ratio": "1:1", "api": "Interactions",
+                             "mode": "edit", "input_images": 2, "image_size": "2K", "thinking_level": "high"}
+
+
+def test_edit_auto_fallback_resends_images():
+    not_found = httpx.Response(404, json={"error": {"code": 404, "status": "NOT_FOUND", "message": "not found"}})
+    rec = Recorder(not_found, ia_ok())
+    backend = GeminiBackend(section(extra_body='{"safetySettings": []}'))
+    result = run(backend, rec, edit_req(png_in(900, 1200)))
+    assert [str(r.url) for r in rec.requests] == [GC_URL, IA_URL]
+    assert rec.body(0)["contents"][0]["parts"][1] == {"inlineData": {"mimeType": "image/png", "data": b64(PNG)}}
+    assert rec.body(1)["input"] == [{"type": "text", "text": "make the sky red"},
+                                    {"type": "image", "mime_type": "image/png", "data": b64(PNG)}]
+    assert rec.body(1)["response_format"] == {"type": "image", "aspect_ratio": "3:4"}
+    assert "safetySettings" not in rec.body(1)
+    assert result.params["api"] == "Interactions" and result.params["mode"] == "edit"
+
+
+def test_edit_per_model_image_limit():
+    # gemini-2.5-flash-image 只使用前 3 张，记录中注明
+    images = [png_in(), jpeg_in(), png_in(), jpeg_in(), png_in()]
+    rec = Recorder(gc_ok())
+    backend = GeminiBackend(section(model="gemini-2.5-flash-image"))
+    result = run(backend, rec, edit_req(*images))
+    parts = rec.body()["contents"][0]["parts"]
+    assert [p["inlineData"]["mimeType"] for p in parts[1:]] == ["image/png", "image/jpeg", "image/png"]
+    assert result.params["input_images"] == 3 and result.params["input_images_dropped"] == 2
+    assert backend.plan(edit_req(*images))["input_images"] == 3
+
+    # 其他模型最多 14 张
+    rec = Recorder(gc_ok())
+    result = run(GeminiBackend(section()), rec, edit_req(*([png_in()] * 15)))
+    assert len(rec.body()["contents"][0]["parts"]) == 1 + 14
+    assert result.params["input_images"] == 14 and result.params["input_images_dropped"] == 1
+
+    rec = Recorder(gc_ok())
+    result = run(GeminiBackend(section()), rec, edit_req(*([png_in()] * 14)))
+    assert len(rec.body()["contents"][0]["parts"]) == 15 and "input_images_dropped" not in result.params
+
+
+def test_edit_missing_for_model_without_image_input(monkeypatch):
+    monkeypatch.setitem(MODEL_CAPS, "text-only-image-model", Caps(RATIOS, (), (), 0))
+    backend = GeminiBackend(section(model="text-only-image-model"))
+    assert backend.edit_missing() == (f"当前模型 text-only-image-model 不支持修改图片，"
+                                      f"请换用 {DEFAULT_MODEL} 等 Nano Banana 模型")
+    rec = Recorder(gc_ok())
+    with pytest.raises(DrawError, match="不支持修改图片"):
+        run(backend, rec, edit_req())
+    assert rec.requests == []
+    # 文生图不受影响
+    assert run(backend, rec).image == PNG
+
+
+def test_edit_input_formats():
+    # MIME 按文件头识别，声明的值不可信
+    assert encode_inputs([InputImage(JPEG, "image/png"), InputImage(WEBP, "application/octet-stream")]) == [
+        ("image/jpeg", b64(JPEG)), ("image/webp", b64(WEBP))]
+    # 无法识别文件头时才使用声明的、官方支持的 MIME
+    assert encode_inputs([InputImage(b"\x00\x00\x00\x18ftypheic", "IMAGE/HEIC")])[0][0] == "image/heic"
+    for image, shown in ((InputImage(GIF, "image/gif"), "image/gif"),
+                         (InputImage(b"\x00" * 10, "application/octet-stream"), "application/octet-stream"),
+                         (InputImage(b"\x00" * 10, ""), "未知")):
+        with pytest.raises(DrawError, match=f"不支持第 2 张图片的格式（{shown}）"):
+            encode_inputs([png_in(), image])
+    # 不支持的格式在发请求前报错
+    rec = Recorder(gc_ok())
+    with pytest.raises(DrawError, match="不支持第 1 张图片的格式"):
+        run(GeminiBackend(section()), rec, edit_req(InputImage(GIF, "image/gif", 10, 10)))
+    assert rec.requests == []
+    # 声明为 PNG / JPEG / WebP 但文件头不符、或数据为空：不当作该格式发送（只会得到 400）
+    for image in (InputImage(b"\x00" * 10, "image/png"), InputImage(b"garbage", "image/jpeg"),
+                  InputImage(b"", "image/png"), InputImage(b"", "")):
+        with pytest.raises(DrawError, match="第 2 张图片的数据无法识别"):
+            encode_inputs([png_in(), image])
+    rec = Recorder(gc_ok())
+    with pytest.raises(DrawError, match="数据无法识别"):
+        run(GeminiBackend(section()), rec, edit_req(InputImage(b"\x00" * 10, "image/png", 10, 10)))
+    assert rec.requests == []
+    # bytearray 也可以
+    assert encode_inputs([InputImage(bytearray(PNG), "image/png")]) == [("image/png", b64(PNG))]
+
+
+def test_edit_inline_size_limit(monkeypatch):
+    assert gemini_mod.MAX_INLINE_B64 == 95_000_000
+    monkeypatch.setattr(gemini_mod, "MAX_INLINE_B64", len(b64(PNG)) * 2 - 1)
+    with pytest.raises(DrawError, match="合计过大"):
+        encode_inputs([png_in(), png_in()])
+    rec = Recorder(gc_ok())
+    with pytest.raises(DrawError, match="合计过大"):
+        run(GeminiBackend(section()), rec, edit_req(png_in(), png_in()))
+    assert rec.requests == []
+    assert run(GeminiBackend(section()), rec, edit_req(png_in())).image == PNG
+
+
+def test_edit_ignores_strength_and_sends_no_unknown_fields():
+    rec = Recorder(gc_ok())
+    result = run(GeminiBackend(section(image_size="4K", thinking_level="medium")), rec,
+                 edit_req(png_in(1200, 900), orientation="landscape", strength=0.7))
+    body = rec.body()
+    assert "strength" not in json.dumps(body).lower() and "mask" not in json.dumps(body).lower()
+    assert set(body) == {"contents", "generationConfig"}
+    config = body["generationConfig"]
+    assert set(config) == {"responseModalities", "imageConfig", "thinkingConfig"}
+    assert config["imageConfig"] == {"aspectRatio": "4:3", "imageSize": "4K"}
+    assert len(body["contents"]) == 1 and body["contents"][0]["role"] == "user"  # 单个 user 回合
+    assert all("thoughtSignature" not in part for part in body["contents"][0]["parts"])
+    assert "strength" not in result.params
+    # 参数里没有图片数据或 Key
+    assert b64(PNG) not in json.dumps(result.params) and KEY not in json.dumps(result.params)
+
+
+@pytest.mark.parametrize(
+    ("payload", "pattern"),
+    [
+        ({"promptFeedback": {"blockReason": "IMAGE_SAFETY"}}, "拒绝修改：图片或修改要求被安全策略拦截（IMAGE_SAFETY）"),
+        ({"candidates": [{"finishReason": "IMAGE_PROHIBITED_CONTENT"}]}, "被安全策略拦截（IMAGE_PROHIBITED_CONTENT）"),
+        ({"candidates": [{"content": {"parts": [{"text": "I cannot edit photos of real people."}]},
+                          "finishReason": "STOP"}]}, "模型回复：I cannot edit photos of real people"),
+        ({"candidates": [{"finishReason": "NO_IMAGE"}]}, "没能生成图片"),
+    ],
+)
+def test_edit_refusals(payload, pattern, sleeps):
+    rec = Recorder(httpx.Response(200, json=payload), gc_ok())
+    with pytest.raises(DrawError, match=pattern) as info:
+        run(GeminiBackend(section()), rec, edit_req())
+    assert not info.value.retryable and len(rec.requests) == 1 and sleeps == []
+
+
+def test_edit_interactions_input_blocked(sleeps):
+    rec = Recorder(httpx.Response(400, json={"error": {"code": "prohibited_content", "message": "Input blocked: x"}}))
+    with pytest.raises(DrawError, match="被安全策略拦截（prohibited_content）") as info:
+        run(GeminiBackend(section(api="interactions")), rec, edit_req())
+    assert info.value.status == 400 and len(rec.requests) == 1 and sleeps == []
+
+
+@pytest.mark.parametrize(("failure", "retried"), [
+    (httpx.ReadTimeout("slow"), False),
+    (httpx.Response(500, json={"error": {"code": 500, "message": "internal"}}), False),
+    (httpx.Response(504, json={"error": {"code": 504, "message": "deadline"}}), False),
+    (httpx.Response(503, json={"error": {"code": 503, "message": "overloaded"}}), True),
+    (httpx.ConnectError("refused"), True),
+])
+def test_edit_retry_policy(failure, retried, sleeps):
+    rec = Recorder(failure, gc_ok())
+    if retried:
+        assert run(GeminiBackend(section()), rec, edit_req()).image == PNG
+        assert len(rec.requests) == 2 and rec.body(0) == rec.body(1)  # 重试时原样重发图片
+    else:
+        with pytest.raises(DrawError) as info:
+            run(GeminiBackend(section()), rec, edit_req())
+        assert not info.value.retryable and len(rec.requests) == 1 and sleeps == []
+
+
+def test_edit_key_echo_masked():
+    body = {"error": {"code": "invalid_request", "message": f"bad x-goog-api-key: {KEY}"}}
+    rec = Recorder(httpx.Response(400, json=body))
+    with pytest.raises(DrawError) as info:
+        run(GeminiBackend(section(base_url="proxy.example.com")), rec, edit_req())
+    assert KEY not in str(info.value) and "••••" in str(info.value)
+
+
+# ---------------------------------------------------------------- 计费错误与余额
+
+
+@pytest.mark.parametrize("status", [429, 402, 200])
+def test_prepay_depleted_not_retried(status, sleeps):
+    payload = {"error": {"code": 429 if status == 200 else status, "status": "RESOURCE_EXHAUSTED",
+                         "message": "Your prepayment credits are depleted. Please go to AI Studio."}}
+    rec = Recorder(httpx.Response(status, json=payload), gc_ok())
+    with pytest.raises(DrawError, match="预付费余额不足") as info:
+        run(GeminiBackend(section()), rec, edit_req())
+    assert BILLING_URL in str(info.value) and not info.value.retryable
+    assert len(rec.requests) == 1 and sleeps == []
+
+
+def test_ordinary_429_still_retried(sleeps):
+    limited = httpx.Response(429, json={"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "rate"}})
+    rec = Recorder(limited, gc_ok())
+    assert run(GeminiBackend(section()), rec, edit_req()).image == PNG
+    assert len(rec.requests) == 2 and len(sleeps) == 1
+
+
+def test_billing_error_mappings():
+    e = gemini_error("Gemini", 402, {"error": {"code": "payment_required", "message": "depleted"}}, httpx.Headers())
+    assert "预付费余额不足" in str(e) and BILLING_URL in str(e) and e.status == 402 and not e.retryable
+    # 中转服务自己的 402
+    e = gemini_error("Gemini", 402, {"error": {"message": "insufficient quota on relay"}}, httpx.Headers())
+    assert "余额不足（HTTP 402）：insufficient quota on relay" in str(e) and "中转服务" in str(e) and not e.retryable
+    e = gemini_error("Gemini", 403, {"error": {"code": 403, "status": "PERMISSION_DENIED",
+                                               "message": "Your project has an outstanding balance."}}, httpx.Headers())
+    assert "未付款项" in str(e) and "outstanding balance" in str(e) and not e.retryable
+    e = gemini_error("Gemini", 400, {"error": {"code": 400, "status": "INVALID_ARGUMENT", "message":
+                                               "Request payload size exceeds the limit: 104857600 bytes."}},
+                     httpx.Headers())
+    assert "请求内容过大（HTTP 400）" in str(e) and "104857600" in str(e) and not e.retryable
+    e = gemini_error("Gemini", 413, "<html><title>413 Request Entity Too Large</title></html>", httpx.Headers())
+    assert "请求内容过大（HTTP 413）" in str(e) and "Request Entity Too Large" in str(e)
+    # 其他 400 / 403 不受影响
+    e = gemini_error("Gemini", 400, {"error": {"code": 400, "message": "Invalid value at 'x'"}}, httpx.Headers())
+    assert "请求参数有误" in str(e)
+    e = gemini_error("Gemini", 403, {"error": {"code": 403, "message": "Method doesn't allow"}}, httpx.Headers())
+    assert "没有权限" in str(e)
+
+
+@pytest.mark.parametrize("config", [section(), {}, section(model="gemini-3-pro-image", base_url="proxy.example.com")])
+def test_balance_not_supported(config):
+    backend = GeminiBackend(config)
+    reason = backend.balance_missing()
+    assert reason == (f"Gemini API 没有查询余额的接口：预付费余额和交易记录只能在 AI Studio 结算页 {BILLING_URL} 查看，"
+                      f"用量见 {USAGE_URL}，项目支出上限见 {SPEND_URL}")
+    assert KEY not in reason
+    rec = Recorder(gc_ok())
+    with pytest.raises(DrawError) as info:
+        run(backend, rec, balance=True)
+    assert str(info.value) == reason and rec.requests == []
+
+
+# ---------------------------------------------------------------- 配置结构（修改图片 / 余额）
+
+
+def test_schema_hints_cover_edit_and_balance():
+    items = schema_section()["items"]
+    hint = items["model"]["hint"]
+    assert "修改图片" in hint and str(MAX_EDIT_IMAGES) in hint
+    assert "gemini-2.5-flash-image" in hint and str(MODEL_CAPS["gemini-2.5-flash-image"].edit_images) in hint
+    assert BILLING_URL in items["api_key"]["hint"]
+    assert "修改图片" in items["portrait_size"]["hint"] and "修改图片" in items["api"]["hint"]
+    # 没有只用于余额查询的凭据：Gemini 没有余额接口
+    assert [name for name, field in items.items() if field.get("secret")] == ["api_key"]
+
+
+@pytest.mark.parametrize("api", ["auto", "generate_content", "interactions"])
+def test_schema_defaults_produce_valid_edit_request(api):
+    defaults = {name: field["default"] for name, field in schema_section()["items"].items()}
+    defaults.update(api_key=KEY, api=api)
+    rec = Recorder(ia_ok() if api == "interactions" else gc_ok())
+    result = run(GeminiBackend(defaults), rec, edit_req(jpeg_in(1200, 900), orientation="landscape"))
+    assert result.image == PNG and result.params["mode"] == "edit" and result.params["input_images"] == 1
+    if api == "interactions":
+        assert rec.body()["input"][1] == {"type": "image", "mime_type": "image/jpeg", "data": b64(JPEG)}
+        assert rec.body()["response_format"] == {"type": "image", "aspect_ratio": "4:3"}
+    else:
+        assert_valid_gc_body(rec.body(), DEFAULT_MODEL)
+        assert rec.body()["generationConfig"]["imageConfig"] == {"aspectRatio": "4:3"}

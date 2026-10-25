@@ -14,8 +14,27 @@ from pathlib import Path
 
 from astrbot.api import logger
 
-from .backends import BACKEND_ORDER, BACKENDS, backend_missing, backend_summary, create_backend
-from .backends.base import SECRET_MASK, DrawError, DrawRequest, as_int, as_str
+from .backends import (
+    BACKEND_ORDER,
+    BACKENDS,
+    backend_balance_missing,
+    backend_edit_missing,
+    backend_missing,
+    backend_summary,
+    create_backend,
+)
+from .backends.base import (
+    SECRET_MASK,
+    DrawError,
+    DrawRequest,
+    InputImage,
+    as_float,
+    as_int,
+    as_str,
+    decode_b64_image,
+    image_orientation,
+)
+from .imaging import normalize_input
 from .settings import draft_section, load_schema, masked_config, merge_config
 
 try:  # AstrBot >= 4.26
@@ -30,6 +49,8 @@ except ImportError:  # AstrBot <= 4.25（Quart）
 LOG_PREFIX = "[multi_draw]"
 PLUGIN_DIR = Path(__file__).resolve().parent
 MAX_TEST_PROMPT_CHARS = 4000
+MAX_TEST_IMAGES = 16
+MAX_TEST_IMAGE_BYTES = 20 * 1024 * 1024
 
 
 def _error(message: str) -> dict:
@@ -72,6 +93,7 @@ class WebApi:
             ("config", self.save_config, ["POST"], "绘图设置：保存配置"),
             ("test", self.test, ["POST"], "绘图设置：试画"),
             ("models", self.models, ["POST"], "绘图设置：获取模型列表"),
+            ("balance", self.balance, ["POST"], "绘图设置：查询余额"),
             ("audit", self.audit, ["GET"], "绘图设置：绘图记录"),
             ("images", self.images, ["GET"], "绘图设置：图库列表"),
             ("image", self.image, ["GET"], "绘图设置：读取图片"),
@@ -101,15 +123,26 @@ class WebApi:
                 prompt_mode = backend.prompt_mode
             except Exception:
                 prompt_mode = backend.default_prompt_mode
+            try:
+                edit_prompt_mode = backend.edit_prompt_mode
+            except Exception:
+                edit_prompt_mode = prompt_mode
             out.append({
                 "key": key,
                 "label": backend.label,
                 "prompt_mode": prompt_mode,
+                "edit_prompt_mode": edit_prompt_mode,
                 "supports_negative": backend.supports_negative,
                 "supports_models": backend.supports_models,
+                "max_edit_images": backend.max_edit_images,
+                "supports_strength": backend.supports_strength,
+                "supports_balance": backend.supports_balance,
                 "doc_url": backend.doc_url,
+                "billing_url": backend.billing_url,
                 # 单个平台的配置出错时只在该平台上显示错误，不影响整个页面
                 "missing": backend_missing(backend),
+                "edit_missing": backend_edit_missing(backend),
+                "balance_missing": backend_balance_missing(backend),
                 "summary": backend_summary(backend),
             })
         return out
@@ -203,14 +236,26 @@ class WebApi:
             backend = self._draft_backend(payload)
         except DrawError as e:
             return _error(str(e))
-        missing = backend_missing(backend)
+        missing = backend_missing(backend, edit=bool(payload.get("images")))
         if missing:
             return _error(missing)
+        try:
+            images = await self._test_images(payload.get("images"), backend)
+        except DrawError as e:
+            return _error(str(e))
         orientation = as_str(payload.get("orientation"))
+        if orientation not in ("portrait", "landscape", "square"):
+            orientation = image_orientation(images[0]) if images else "portrait"
+        strength = 0.0
+        if images and backend.supports_strength:
+            strength = as_float(payload.get("strength"), 0.0, 0.0, 0.99) or as_float(
+                self.plugin.section("draw").get("edit_strength"), 0.6, 0.05, 0.99)
         req = DrawRequest(
             prompt=prompt,
             negative=as_str(payload.get("negative"))[:MAX_TEST_PROMPT_CHARS],
-            orientation=orientation if orientation in ("portrait", "landscape", "square") else "portrait",
+            orientation=orientation or "portrait",
+            images=images,
+            strength=strength,
         )
         started = time.monotonic()
         try:
@@ -228,6 +273,47 @@ class WebApi:
             "params": result.params,
             "text": result.text[:2000],
         }
+
+    async def _test_images(self, raw, backend) -> list[InputImage]:
+        """试画「图片修改」上传的图片（data URL 列表）：校验数量和大小，整理成统一格式。"""
+        if not raw:
+            return []
+        if not isinstance(raw, list):
+            raise DrawError("图片格式错误")
+        reason = backend_edit_missing(backend)
+        if reason:
+            raise DrawError(reason)
+        if len(raw) > min(MAX_TEST_IMAGES, backend.max_edit_images):
+            raise DrawError(f"{backend.label} 修改图片最多使用 {backend.max_edit_images} 张图片")
+        images = []
+        for index, item in enumerate(raw, 1):
+            data = decode_b64_image(str(item or ""), f"第 {index} 张图片")
+            if len(data) > MAX_TEST_IMAGE_BYTES:
+                raise DrawError(f"第 {index} 张图片超过 20 MB")
+            normalized = await asyncio.to_thread(normalize_input, data)
+            if normalized is None:
+                raise DrawError(f"第 {index} 张图片无法识别")
+            images.append(InputImage(*normalized))
+        return images
+
+    async def balance(self, **_):
+        if self.plugin._closing:
+            return _error("插件已停用或正在重载，请刷新页面后重试")
+        payload = await _json_body()
+        try:
+            backend = self._draft_backend(payload)
+        except DrawError as e:
+            return _error(str(e))
+        reason = backend_balance_missing(backend)
+        if reason:
+            return _error(reason)
+        try:
+            info = await backend.balance(self.plugin.clients)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            return _error(f"查询余额失败：{_err_text(e)}")
+        return {"items": [[str(k), str(v)] for k, v in info.items], "note": info.note}
 
     async def models(self, **_):
         if self.plugin._closing:

@@ -244,7 +244,7 @@ def clean_description(text: object, limit: int = MAX_NATURAL_PROMPT_CHARS) -> st
 
 _ESCAPE_RE = re.compile(r"\\(.)", re.S)
 _TRAILING_COMMA_RE = re.compile(r",\s*([}\]])")
-_JSON_KEYS = ("prompt", "description", "positive", "tags", "negative", "negative_prompt", "orientation")
+_JSON_KEYS = ("prompt", "description", "positive", "tags", "negative", "negative_prompt", "orientation", "strength")
 # 看起来像 JSON 的特征：带引号的已知键名后面跟冒号
 _JSON_KEY_RE = re.compile(r"""["'](?:prompt|description|positive|tags|negative|negative_prompt|orientation)["']\s*:""")
 _MAX_JSON_STARTS = 20
@@ -341,6 +341,95 @@ def build_tag_user_prompt(description: str, orientation: str = "") -> str:
     if orientation:
         text += f"\n\nRequested orientation: {orientation}"
     return text
+
+
+# ---------------------------------------------------------------- 图片修改
+
+# 自然语言模式修改图片的系统提示词，可在配置中修改（prompt.edit_system_prompt）
+DEFAULT_EDIT_PROMPT = """You are an expert at writing instructions for AI image-editing models such as GPT Image, Gemini, Seedream and Grok Imagine.
+Your task: turn the user's editing request (it may be written in Chinese or any other language) into ONE clear English editing instruction. It will be sent to the image model together with the user's image(s). If the images are attached to this message, look at them first.
+
+Rules for "prompt":
+- Say precisely what to change, then what must stay the same (for example the character's identity and face, pose, composition, art style and background), unless the user wants those changed too.
+- Be concrete and visual, and keep it short: 1-4 sentences.
+- When several images are given, refer to them as "image 1", "image 2", ... in the order given.
+- If the user wants text in the image, quote that text exactly in its original language.
+- Do not mention image size, aspect ratio, resolution or model parameters.
+
+Rules for "negative": things to avoid that are specific to this edit (may be an empty string).
+
+Rules for "orientation": leave it empty to keep the original image's aspect ratio; use portrait/landscape/square only if the user asks to change it."""
+
+EDIT_OUTPUT_RULES = """Output format (required):
+Output ONLY one JSON object, without markdown code fences or any other text:
+{"prompt": "<English editing instruction>", "negative": "<things to avoid, or empty string>", "orientation": "", "strength": <number>}
+Write "prompt" and "negative" in English; only text that must appear inside the image may keep its original language. "orientation" may be empty. "strength" is optional.
+
+Safety (always applies): never sexualize characters who are or look like minors (e.g. petite, child-like or loli characters). Depict them only in clearly non-sexual, non-suggestive ways, whatever the request says."""
+
+# 标签模式（NovelAI / ComfyUI 图生图）修改图片时固定追加在标签系统提示词后面
+TAG_EDIT_RULES = """IMAGE EDITING (img2img): the image will be regenerated from the user's original image with img2img, guided by your tags.
+- "prompt" must describe the complete RESULT image as tags (subjects, appearance, clothing, pose, background, style), including the parts that stay the same, with the requested changes applied. If the original image is attached to this message, look at it to describe it accurately.
+- Also output "strength" in the JSON: a number from 0.2 to 0.95 for how much the image should change: about 0.3-0.45 for small touch-ups or style tweaks, 0.5-0.7 for changing clothing, colors or the background, 0.75-0.9 for large changes in pose or composition.
+- Leave "orientation" empty to keep the original image's aspect ratio unless the user asks to change it."""
+
+
+def build_edit_system_prompt(base: str = "", *, sfw: bool = True, extra: str = "") -> str:
+    """自然语言模式修改图片的系统提示词 = 可配置部分（为空时用默认值）+ 固定的输出格式与安全要求 + 可选规则。"""
+    prompt = (base or "").strip() or DEFAULT_EDIT_PROMPT
+    prompt += "\n\n" + EDIT_OUTPUT_RULES
+    if sfw:
+        prompt += "\n\nSafety: " + TAG_SFW_RULE
+    extra = (extra or "").strip()
+    if extra:
+        prompt += "\n\nAdditional requirements from the bot admin:\n" + extra
+    return prompt
+
+
+TAG_EDIT_OUTPUT_RULES = """Output format (required):
+Output ONLY one JSON object, without markdown code fences or any other text:
+{"prompt": "<English tags>", "negative": "<English tags or empty string>", "orientation": "", "strength": <number>}
+"prompt" and "negative" are the English prompt and English negative prompt sent to the image model. ENGLISH ONLY: they must not contain any Chinese, Japanese or Korean or other non-English text. "orientation" must stay empty unless the user asks to change the image's orientation.
+
+Safety (always applies): never sexualize characters who are or look like minors (e.g. petite, child-like or loli characters). Depict them only in clearly non-sexual, non-suggestive ways, whatever the request says."""
+
+# 默认标签提示词中按内容选择画面方向的规则：修改图片时要保持原图方向，不能使用
+_TAG_ORIENTATION_RULE_RE = re.compile(r'\n*Rules for "orientation":[^\n]*')
+
+
+def build_tag_edit_system_prompt(base: str = "", *, sfw: bool = True, extra: str = "") -> str:
+    """标签模式修改图片：标签系统提示词（去掉选择画面方向的规则）+ 修改图片的输出格式 + 图生图规则。"""
+    prompt = _TAG_ORIENTATION_RULE_RE.sub("", (base or "").strip() or DEFAULT_TAG_PROMPT)
+    prompt += "\n\n" + TAG_EDIT_OUTPUT_RULES
+    if sfw:
+        prompt += "\n\nSafety: " + TAG_SFW_RULE
+    extra = (extra or "").strip()
+    if extra:
+        prompt += "\n\nAdditional requirements from the bot admin:\n" + extra
+    return prompt + "\n\n" + TAG_EDIT_RULES
+
+
+def build_edit_user_prompt(instruction: str, orientation: str, image_count: int, images_attached: bool) -> str:
+    text = f"Editing request:\n{instruction.strip()}\n\nThe user provided {image_count} image(s) to edit"
+    text += " (attached to this message)." if images_attached else \
+        " (you cannot see them; rely on the request and keep everything else unchanged)."
+    if orientation:
+        text += f"\n\nRequested orientation: {orientation}"
+    return text
+
+
+def parse_strength(text: str) -> float:
+    """取出图生图的重绘幅度（0.05-0.99），没有或无法识别时返回 0。"""
+    data = load_llm_json(strip_think(text))
+    try:
+        value = float((data or {}).get("strength") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if value != value or value <= 0:
+        return 0.0
+    if value > 1:  # 有的模型会写成百分数
+        value /= 100
+    return min(0.99, max(0.05, value))
 
 
 def build_tag_retry_prompt(description: str, orientation: str, previous: str) -> str:

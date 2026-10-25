@@ -2,8 +2,12 @@
 
 import asyncio
 import base64
+import email.parser
+import email.policy
 import json
+import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -14,7 +18,7 @@ sys.path.insert(0, str(PLUGIN_DIR))
 
 from backends import base  # noqa: E402
 from backends import openai as oai  # noqa: E402
-from backends.base import Clients, DrawError, DrawRequest, HttpPool  # noqa: E402
+from backends.base import BalanceInfo, Clients, DrawError, DrawRequest, HttpPool, InputImage  # noqa: E402
 from backends.openai import OpenAIBackend  # noqa: E402
 
 
@@ -56,6 +60,8 @@ def run(section, rec, req=None, *, action="generate"):
             backend = OpenAIBackend(section)
             if action == "models":
                 return await backend.list_models(Clients(http=pool))
+            if action == "balance":
+                return await backend.balance(Clients(http=pool))
             return await backend.generate(Clients(http=pool), req or DrawRequest("a cat"))
         finally:
             await pool.close()
@@ -509,6 +515,11 @@ def test_configured():
     assert backend.timeout == 300.0
     assert OpenAIBackend({"api_key": KEY, "model": "dall-e-3", "portrait_size": "auto"}).summary() == \
         "OpenAI / dall-e-3 / 竖图 自动"
+    assert backend.max_edit_images == 16 and not backend.supports_strength and backend.supports_balance
+    assert backend.billing_url == "https://platform.openai.com/settings/organization/billing"
+    assert backend.edit_missing() == "" and backend.edit_model == "gpt-image-2.5-flare"
+    assert OpenAIBackend({"api_key": KEY, "edit_model": "gpt-image-2.5-sunburst"}).summary() == \
+        "OpenAI / gpt-image-2.5-flare / 竖图 1024x1536 / 修改图片 gpt-image-2.5-sunburst"
 
 
 def test_garbage_config_values_still_valid_request():
@@ -568,7 +579,7 @@ def test_schema_section_shape_and_defaults_match_code():
     assert section["type"] == "object" and section["description"]
     assert list(items) == ["api_key", "base_url", "proxy_url", "model", "portrait_size", "landscape_size",
                            "square_size", "quality", "output_format", "background", "moderation", "response_format",
-                           "timeout", "extra_body"]
+                           "edit_model", "edit_size", "timeout", "extra_body", "balance_mode", "balance_key"]
     for name, field in items.items():
         assert field["type"] in ("string", "text", "int", "float", "bool", "list"), name
         assert field["description"] and field["hint"], name
@@ -577,6 +588,17 @@ def test_schema_section_shape_and_defaults_match_code():
             assert len(field.get("labels", field["options"])) == len(field["options"]), name
     assert items["api_key"]["secret"] is True
     assert "options" not in items["model"]
+    assert "修改图片" in items["model"]["hint"] and "DALL·E 不支持" in items["model"]["hint"]
+    # 修改图片
+    assert items["edit_model"]["default"] == "" and "options" not in items["edit_model"]
+    assert items["edit_size"]["default"] == oai.DEFAULT_EDIT_SIZE
+    assert items["edit_size"]["options"] == list(oai.EDIT_SIZE_MODES)
+    # 余额查询：管理密钥是密文字段，提示中说明只用于查询消费
+    assert items["balance_mode"]["default"] == oai.DEFAULT_BALANCE_MODE
+    assert items["balance_mode"]["options"] == list(oai.BALANCE_MODES)
+    assert items["balance_key"]["secret"] is True and items["balance_key"]["default"] == ""
+    assert "只用于" in items["balance_key"]["hint"] and "不能用于绘图" in items["balance_key"]["hint"]
+    assert "secret" not in items["edit_model"] and "secret" not in items["balance_mode"]
     assert items["base_url"]["default"] == oai.DEFAULT_BASE_URL
     assert items["model"]["default"] == oai.DEFAULT_MODEL
     for orientation, size in oai.DEFAULT_SIZES.items():
@@ -601,3 +623,632 @@ def test_schema_defaults_produce_valid_request(orientation):
     assert rec.body() == {"model": "gpt-image-2.5-flare", "prompt": "a cat", "n": 1,
                           "size": oai.DEFAULT_SIZES[orientation], "quality": "medium"}
     assert result.params["size"] == oai.DEFAULT_SIZES[orientation]
+
+
+@pytest.mark.parametrize("orientation", ["portrait", "landscape", "square"])
+def test_schema_defaults_produce_valid_edit_request(orientation):
+    items = load_schema_section()["items"]
+    section = {name: field["default"] for name, field in items.items()}
+    section["api_key"] = KEY
+    backend = OpenAIBackend(section)
+    assert backend.edit_missing() == ""
+    # 默认的余额查询方式：官方地址、没有管理密钥 → 说明原因而不是报错
+    assert "管理密钥" in backend.balance_missing()
+    rec = Recorder(ok_json())
+    size = {"portrait": (800, 1200), "landscape": (1200, 800), "square": (1000, 1000)}[orientation]
+    req = DrawRequest("make it night", orientation=orientation, images=[InputImage(JPEG, "image/jpeg", *size)])
+    result = run(section, rec, req)
+    assert str(rec.requests[0].url) == EDIT_URL
+    fields, files = parse_multipart(rec.requests[0])
+    assert fields == {"model": "gpt-image-2.5-flare", "prompt": "make it night", "n": "1",
+                      "size": oai.DEFAULT_SIZES[orientation], "quality": "medium"}
+    assert [f[:3] for f in files] == [("image", "image_1.jpg", "image/jpeg")]
+    assert result.params["mode"] == "edit"
+
+
+# ---------------------------------------------------------------- 图片修改
+
+
+EDIT_URL = "https://api.openai.com/v1/images/edits"
+WEBP = b"RIFF\x00\x00\x00\x00WEBP" + b"\x00" * 32
+GIF = b"GIF89a" + b"\x00" * 32
+
+
+def parse_multipart(request: httpx.Request) -> tuple[dict, list]:
+    """解析 multipart 请求体，返回 (文本字段, [(字段名, 文件名, 类型, 内容)])。"""
+    ctype = request.headers["content-type"]
+    assert ctype.startswith("multipart/form-data; boundary=")
+    msg = email.parser.BytesParser(policy=email.policy.HTTP).parsebytes(
+        b"Content-Type: " + ctype.encode() + b"\r\n\r\n" + request.content)
+    fields, files = {}, []
+    for part in msg.iter_parts():
+        name = part.get_param("name", header="content-disposition")
+        payload = part.get_payload(decode=True)
+        if part.get_filename():
+            files.append((name, part.get_filename(), part.get_content_type(), payload))
+        else:
+            assert name not in fields, name
+            fields[name] = payload.decode()
+    return fields, files
+
+
+def edit_req(*images, prompt="Make the sky purple", orientation="portrait", negative=""):
+    return DrawRequest(prompt, negative=negative, orientation=orientation,
+                       images=list(images) or [InputImage(JPEG, "image/jpeg", 1024, 1536)])
+
+
+def test_edit_request_single_image():
+    rec = Recorder(ok_json(size="1024x1536", quality="medium", output_format="png", usage={"total_tokens": 900}))
+    req = edit_req(prompt="Make the sky purple", negative="text")
+    result = run({"api_key": KEY}, rec, req)
+    request = rec.requests[0]
+    assert len(rec.requests) == 1 and request.method == "POST" and str(request.url) == EDIT_URL
+    assert request.headers["authorization"] == f"Bearer {KEY}"
+    fields, files = parse_multipart(request)
+    assert fields == {"model": "gpt-image-2.5-flare", "prompt": "Make the sky purple\n\nAvoid: text", "n": "1",
+                      "size": "1024x1536", "quality": "medium"}
+    # 一张图时字段名为 image（与官方 SDK 一致），文件名和类型与内容一致
+    assert files == [("image", "image_1.jpg", "image/jpeg", JPEG)]
+    assert result.image == PNG and result.mime == "image/png"
+    assert result.params == {"mode": "edit", "model": "gpt-image-2.5-flare", "size": "1024x1536",
+                             "input_images": 1, "quality": "medium", "output_format": "png", "tokens": 900}
+
+
+def test_edit_request_multiple_images_keep_order_and_detect_type():
+    rec = Recorder(ok_json())
+    # InputImage.mime 写错时以文件内容为准（中转服务按扩展名推断类型）
+    req = edit_req(InputImage(JPEG, "image/jpeg", 1024, 1536), InputImage(PNG, "image/jpeg", 800, 600),
+                   InputImage(WEBP, "image/webp", 512, 512))
+    result = run({"api_key": KEY}, rec, req)
+    _, files = parse_multipart(rec.requests[0])
+    assert [f[:3] for f in files] == [("image[]", "image_1.jpg", "image/jpeg"), ("image[]", "image_2.png", "image/png"),
+                                      ("image[]", "image_3.webp", "image/webp")]
+    assert [f[3] for f in files] == [JPEG, PNG, WEBP]
+    assert result.params["input_images"] == 3 and "ignored_images" not in result.params
+
+
+def test_edit_more_than_16_images_trimmed():
+    rec = Recorder(ok_json())
+    images = [InputImage(PNG, "image/png", 1024, 1024) for _ in range(17)]
+    result = run({"api_key": KEY}, rec, edit_req(*images, orientation="square"))
+    _, files = parse_multipart(rec.requests[0])
+    assert len(files) == 16 and {f[0] for f in files} == {"image[]"}
+    assert files[-1][1] == "image_16.png"
+    assert result.params["input_images"] == 16 and result.params["ignored_images"] == 1
+
+
+@pytest.mark.parametrize(("data", "match"), [(GIF, "image/gif"), (b"not an image", "image/jpeg")])
+def test_edit_unsupported_image_format_rejected(data, match):
+    rec = Recorder(ok_json())
+    with pytest.raises(DrawError, match=f"第 1 张图片的格式（{match}）.*PNG / JPEG / WebP"):
+        run({"api_key": KEY}, rec, edit_req(InputImage(data, "image/jpeg", 100, 100)))
+    assert not rec.requests
+
+
+def test_edit_image_too_large_and_prompt_too_long(monkeypatch):
+    rec = Recorder(ok_json())
+    monkeypatch.setattr(oai, "MAX_EDIT_IMAGE_BYTES", 40)
+    with pytest.raises(DrawError, match="第 2 张图片超过 50 MB"):
+        run({"api_key": KEY}, rec, edit_req(InputImage(PNG[:30], "image/png"), InputImage(PNG, "image/png")))
+    monkeypatch.undo()
+    with pytest.raises(DrawError, match="修改说明超过 32000 个字符"):
+        run({"api_key": KEY}, rec, edit_req(prompt="x" * 32001))
+    assert not rec.requests
+
+
+def test_edit_model_overrides_drawing_model_and_plan():
+    section = {"api_key": KEY, "model": "gpt-image-2.5-flare", "edit_model": "gpt-image-2.5-sunburst"}
+    req = edit_req(InputImage(JPEG, "image/jpeg", 1536, 2048))
+    backend = OpenAIBackend(section)
+    assert backend.plan(req) == {"mode": "edit", "model": "gpt-image-2.5-sunburst", "size": "1088x1456"}
+    assert backend.plan(DrawRequest("x")) == {"model": "gpt-image-2.5-flare", "size": "1024x1536"}
+    rec = Recorder(ok_json())
+    result = run(section, rec, req)
+    fields, _ = parse_multipart(rec.requests[0])
+    assert fields["model"] == "gpt-image-2.5-sunburst" and result.params["model"] == "gpt-image-2.5-sunburst"
+    # 文生图仍使用绘图模型
+    rec = Recorder(ok_json())
+    run(section, rec, DrawRequest("x"))
+    assert rec.body()["model"] == "gpt-image-2.5-flare"
+
+
+@pytest.mark.parametrize(("section", "model"), [
+    ({"model": "dall-e-3"}, "dall-e-3"),
+    ({"model": "gpt-image-2", "edit_model": "dall-e-2"}, "dall-e-2"),
+    ({"model": "dall-e-2", "edit_model": "openai/dall-e-3"}, "openai/dall-e-3"),
+])
+def test_edit_missing_for_dalle(section, model):
+    backend = OpenAIBackend({"api_key": KEY, **section})
+    reason = backend.edit_missing()
+    assert f"当前模型 {model} 不支持修改图片" in reason and "gpt-image-2.5-sunburst" in reason
+    rec = Recorder(ok_json())
+    with pytest.raises(DrawError, match="不支持修改图片"):
+        run({"api_key": KEY, **section}, rec, edit_req())
+    assert not rec.requests
+
+
+@pytest.mark.parametrize("model", ["gpt-image-2.5-sunburst", "gpt-image-2", "gpt-image-1.5", "chatgpt-image-latest",
+                                   "openai/gpt-image-2", "flux-kontext-pro"])
+def test_edit_supported_models(model):
+    assert OpenAIBackend({"api_key": KEY, "model": model}).edit_missing() == ""
+
+
+@pytest.mark.parametrize(("section", "image", "orientation", "size"), [
+    # gpt-image-2 / 2.5：保持原图比例，像素数与该方向的尺寸设置相同
+    ({}, (1536, 2048), "portrait", "1088x1456"),
+    ({}, (2048, 1152), "landscape", "1680x944"),
+    ({}, (1000, 1100), "square", "976x1072"),
+    ({}, (600, 2000), "portrait", "720x2160"),  # 超过 1:3 时限制在 1:3
+    ({"portrait_size": "2K"}, (1536, 2048), "portrait", "1328x1776"),
+    ({"portrait_size": "auto"}, (1536, 2048), "portrait", "1088x1456"),
+    ({"model": "gpt-image-2"}, (1536, 2048), "portrait", "1088x1456"),
+    # 用户要求换方向：使用该方向的尺寸
+    ({}, (1536, 2048), "landscape", "1536x1024"),
+    ({"landscape_size": "1920x1080"}, (1536, 2048), "landscape", "1936x1088"),
+    # 不知道原图尺寸
+    ({}, (0, 0), "portrait", "1024x1536"),
+    # 旧 GPT Image 模型只有三种标准尺寸
+    ({"model": "gpt-image-1.5"}, (1536, 2048), "portrait", "1024x1536"),
+    ({"model": "chatgpt-image-latest"}, (1000, 1000), "square", "1024x1024"),
+    # 其他设置
+    ({"edit_size": "orientation"}, (1536, 2048), "portrait", "1024x1536"),
+    ({"edit_size": "auto"}, (1536, 2048), "portrait", "auto"),
+    ({"edit_size": "AUTO", "model": "gpt-image-1.5"}, (1536, 2048), "portrait", "auto"),
+    ({"edit_size": "bogus"}, (1536, 2048), "portrait", "1088x1456"),
+    # 中转服务上规则未知的模型：保持原图比例时不发送尺寸，按方向时与文生图相同
+    ({"model": "flux-kontext-pro"}, (1536, 2048), "portrait", None),
+    ({"model": "flux-kontext-pro", "edit_size": "auto"}, (1536, 2048), "portrait", None),
+    ({"model": "flux-kontext-pro", "edit_size": "orientation"}, (1536, 2048), "portrait", "1024x1536"),
+])
+def test_edit_size(section, image, orientation, size):
+    rec = Recorder(ok_json())
+    req = edit_req(InputImage(JPEG, "image/jpeg", *image), orientation=orientation)
+    result = run({"api_key": KEY, **section}, rec, req)
+    fields, _ = parse_multipart(rec.requests[0])
+    assert fields.get("size") == size
+    assert result.params["size"] == (size or "auto")
+    if size and size != "auto":
+        w, h = map(int, size.split("x"))
+        assert w % 16 == 0 and h % 16 == 0
+
+
+@pytest.mark.parametrize(("model", "section", "expected", "absent"), [
+    ("gpt-image-2.5-sunburst", {"quality": "max", "output_format": "jpg", "moderation": "low",
+                                "background": "opaque", "response_format": "url"},
+     {"quality": "max", "output_format": "jpeg", "moderation": "low", "background": "opaque"},
+     ("response_format", "style", "input_fidelity")),
+    ("gpt-image-2", {"quality": "xhigh", "output_format": "webp"}, {"quality": "high", "output_format": "webp"},
+     ("response_format", "input_fidelity", "moderation", "background")),
+    ("gpt-image-1.5", {"quality": "auto", "response_format": "b64_json"}, {},
+     ("quality", "response_format", "input_fidelity")),
+    # 中转服务上的其他模型：按配置发送 response_format，不发送 GPT Image 专用参数
+    ("flux-kontext-pro", {"response_format": "b64_json", "quality": "high", "moderation": "low"},
+     {"response_format": "b64_json"}, ("quality", "moderation", "output_format")),
+    ("flux-kontext-pro", {}, {}, ("response_format",)),
+])
+def test_edit_fields_per_model_family(model, section, expected, absent):
+    rec = Recorder(ok_json())
+    result = run({"api_key": KEY, "model": model, **section}, rec, edit_req())
+    fields, _ = parse_multipart(rec.requests[0])
+    assert fields["model"] == model and fields["n"] == "1"
+    for key, value in expected.items():
+        assert fields[key] == value, key
+        assert result.params[key] == value, key
+    for key in absent:
+        assert key not in fields, key
+    assert not {"seed", "negative_prompt", "strength", "style"} & set(fields)
+
+
+def test_edit_extra_body_as_form_strings():
+    rec = Recorder(ok_json())
+    extra = json.dumps({"output_compression": 80, "n": None, "stream": False, "nested": {"a": 1}, "list": [1],
+                        "background": "transparent", "user": "u1"})
+    result = run({"api_key": KEY, "output_format": "webp", "extra_body": extra}, rec, edit_req())
+    fields, _ = parse_multipart(rec.requests[0])
+    assert fields["output_compression"] == "80" and fields["stream"] == "false" and fields["user"] == "u1"
+    assert fields["background"] == "transparent" and result.params["background"] == "transparent"
+    assert "n" not in fields and "nested" not in fields and "list" not in fields
+
+
+def test_edit_response_variants():
+    def handler(request):
+        if request.url.host == "cdn.example.com":
+            return httpx.Response(200, content=JPEG, headers={"content-type": "image/jpeg"})
+        return httpx.Response(200, json={"data": [{"url": "https://cdn.example.com/a.jpg"}]})
+
+    rec = Recorder(handler)
+    result = run({"api_key": KEY, "base_url": "https://relay.example.com", "model": "flux-kontext-pro"}, rec,
+                 edit_req())
+    assert result.image == JPEG and len(rec.requests) == 2
+    assert str(rec.requests[0].url) == "https://relay.example.com/v1/images/edits"
+    assert "authorization" not in rec.requests[1].headers
+    # 中转服务直接返回图片
+    rec = Recorder(httpx.Response(200, content=PNG, headers={"content-type": "image/png"}))
+    assert run({"api_key": KEY}, rec, edit_req()).image == PNG
+    with pytest.raises(DrawError, match="没有图片"):
+        run({"api_key": KEY}, Recorder(httpx.Response(200, json={"data": []})), edit_req())
+
+
+# ---------------------------------------------------------------- 图片修改的错误
+
+
+@pytest.mark.parametrize(("status", "body"), [
+    (501, {"error": {"message": "API not implemented", "type": "one_api_error", "code": "api_not_implemented"}}),
+    (404, "<html><title>404 Not Found</title></html>"),
+    (405, {"error": {"message": "Method Not Allowed"}}),
+    (200, {"error": {"message": "API not implemented", "type": "one_api_error", "code": "api_not_implemented"}}),
+])
+def test_edit_endpoint_not_supported(status, body, sleeps):
+    resp = httpx.Response(status, json=body) if isinstance(body, dict) else httpx.Response(status, text=body)
+    rec = Recorder(resp)
+    with pytest.raises(DrawError, match=r"不支持修改图片（/images/edits，HTTP \d+）") as info:
+        run({"api_key": KEY, "base_url": "https://relay.example.com"}, rec, edit_req())
+    assert not info.value.retryable and len(rec.requests) == 1 and not sleeps
+
+
+def test_edit_model_not_found_404_keeps_generic_message():
+    rec = Recorder(httpx.Response(404, json={"error": {"message": "The model `gpt-image-9` does not exist",
+                                                       "code": "model_not_found"}}))
+    with pytest.raises(DrawError, match="接口地址或模型不存在"):
+        run({"api_key": KEY, "model": "gpt-image-9"}, rec, edit_req())
+
+
+@pytest.mark.parametrize(("err", "match"), [
+    ({"type": "invalid_request_error", "code": "unsupported_file_mimetype", "param": "image[3]",
+      "message": "Invalid file 'image[3]': unsupported mimetype ('application/octet-stream')."},
+     "不接受这张图片的格式（只支持 PNG / JPEG / WebP）"),
+    ({"type": "invalid_request_error", "code": "unknown_parameter", "param": "moderation",
+      "message": "Unknown parameter: 'moderation'."}, "不接受参数 moderation.*内容审核强度"),
+    ({"type": "invalid_request_error", "code": "invalid_value", "param": "model",
+      "message": "Invalid value: 'gpt-image-1.5'. Value must be 'dall-e-2'."}, "response_format / style"),
+])
+def test_edit_400_errors(err, match, sleeps):
+    rec = Recorder(httpx.Response(400, json={"error": err}))
+    with pytest.raises(DrawError, match=match) as info:
+        run({"api_key": KEY, "moderation": "low"}, rec, edit_req())
+    assert info.value.status == 400 and not info.value.retryable and len(rec.requests) == 1 and not sleeps
+
+
+@pytest.mark.parametrize(("stage", "match"), [
+    ("input", "提示词或输入图片被 OpenAI 的安全系统拦截了（类别：sexual）"),
+    ("output", "生成的图片没有通过 OpenAI 的安全审核"),
+])
+def test_edit_moderation_blocked(stage, match, sleeps):
+    err = {"type": "image_generation_user_error", "code": "moderation_blocked",
+           "moderation_details": {"moderation_stage": stage, "categories": ["sexual"]}}
+    rec = Recorder(httpx.Response(400, json={"error": err}))
+    with pytest.raises(DrawError, match=match) as info:
+        run({"api_key": KEY}, rec, edit_req())
+    assert "换一种描述" in str(info.value) and not info.value.retryable and len(rec.requests) == 1 and not sleeps
+
+
+def test_edit_moderation_details_at_top_level(sleeps):
+    # openai_error 也读取响应顶层的 moderation_details；修改图片时同样要提到输入图片
+    body = {"error": {"type": "image_generation_user_error", "code": "moderation_blocked"},
+            "moderation_details": {"moderation_stage": "input", "categories": ["violence"]}}
+    with pytest.raises(DrawError, match="^提示词或输入图片被 OpenAI 的安全系统拦截了（类别：violence）") as info:
+        run({"api_key": KEY}, Recorder(httpx.Response(400, json=body)), edit_req())
+    assert info.value.status == 400 and not info.value.retryable and not sleeps
+    # 中转服务说明文字里的「提示词被」不改写
+    body = {"error": {"message": "提示词被上游拒绝", "type": "new_api_error"}}
+    with pytest.raises(DrawError, match="请求参数有误（HTTP 400）：提示词被上游拒绝"):
+        run({"api_key": KEY}, Recorder(httpx.Response(400, json=body)), edit_req())
+
+
+def test_edit_413_explains_upload_limit(sleeps):
+    rec = Recorder(httpx.Response(413, text="<html><title>413 Request Entity Too Large</title></html>"))
+    with pytest.raises(DrawError, match=r"拒绝了上传的图片.*HTTP 413.*413 Request Entity Too Large.*减少图片数量") as info:
+        run({"api_key": KEY, "base_url": "https://relay.example.com"}, rec, edit_req())
+    assert info.value.status == 413 and not info.value.retryable and len(rec.requests) == 1 and not sleeps
+
+
+def test_edit_billing_429_not_retried(sleeps):
+    rec = Recorder(httpx.Response(429, json={"error": {"code": "credit_balance_exhausted",
+                                                       "type": "insufficient_quota"}}))
+    with pytest.raises(DrawError, match="余额不足") as info:
+        run({"api_key": KEY}, rec, edit_req())
+    assert not info.value.retryable and len(rec.requests) == 1 and not sleeps
+
+
+def test_edit_rate_limit_retried_with_identical_body(sleeps):
+    limited = httpx.Response(429, json={"error": {"type": "requests", "code": "rate_limit_exceeded"}},
+                             headers={"retry-after": "1"})
+    rec = Recorder(limited, ok_json())
+    req = edit_req(InputImage(JPEG, "image/jpeg", 1024, 1536), InputImage(PNG, "image/png", 512, 512))
+    assert run({"api_key": KEY}, rec, req).image == PNG
+    assert len(rec.requests) == 2 and sleeps == [1.0]
+    assert parse_multipart(rec.requests[0]) == parse_multipart(rec.requests[1])
+    assert len(parse_multipart(rec.requests[1])[1]) == 2
+
+
+@pytest.mark.parametrize("status", [500, 502, 504])
+def test_edit_5xx_not_retried(status, sleeps):
+    rec = Recorder(httpx.Response(status, text="<html><title>Bad Gateway</title></html>"))
+    with pytest.raises(DrawError, match="服务器错误") as info:
+        run({"api_key": KEY}, rec, edit_req())
+    assert not info.value.retryable and len(rec.requests) == 1 and not sleeps
+
+
+def test_edit_read_timeout_not_retried_and_redirect_not_followed(sleeps):
+    rec = Recorder(lambda request: httpx.ReadTimeout("slow", request=request))
+    with pytest.raises(DrawError, match="超时") as info:
+        run({"api_key": KEY}, rec, edit_req())
+    assert not info.value.retryable and len(rec.requests) == 1 and not sleeps
+    rec = Recorder(httpx.Response(302, headers={"location": "https://relay.example.com/v1/images/edits"}), ok_json())
+    with pytest.raises(DrawError, match="跳转"):
+        run({"api_key": KEY, "base_url": "http://relay.example.com"}, rec, edit_req())
+    assert len(rec.requests) == 1
+
+
+def test_edit_api_key_echoed_is_masked():
+    secret = "sk-relay-secret-ABCDEFGH"
+    rec = Recorder(httpx.Response(401, json={"error": {"message": f"invalid token {secret}"}}))
+    with pytest.raises(DrawError, match="API Key 无效") as info:
+        run({"api_key": secret}, rec, edit_req())
+    assert secret not in str(info.value) and "EFGH" in str(info.value)
+
+
+def test_edit_missing_api_key():
+    rec = Recorder(ok_json())
+    with pytest.raises(DrawError, match="API Key"):
+        run({}, rec, edit_req())
+    assert not rec.requests
+
+
+# ---------------------------------------------------------------- 余额：配置检查
+
+
+ADMIN_KEY = "sk-admin-secret-WXYZ9876"
+RELAY = "https://relay.example.com"
+
+
+@pytest.mark.parametrize(("section", "match"), [
+    # 官方地址、没有管理密钥：说明官方没有余额接口并给出账单页面
+    ({"api_key": KEY}, "OpenAI 官方 API 不能用普通 API Key 查询余额.*settings/organization/billing.*管理密钥"),
+    ({"api_key": KEY, "balance_mode": "admin"}, "还没有在 OpenAI 设置中填写管理密钥"),
+    ({"api_key": KEY, "balance_mode": "admin", "base_url": RELAY}, "还没有在 OpenAI 设置中填写管理密钥"),
+    ({"api_key": KEY, "balance_mode": "off", "balance_key": ADMIN_KEY}, "已在 OpenAI 设置中关闭余额查询.*billing"),
+    ({"api_key": KEY, "balance_mode": "off", "base_url": RELAY}, "已在 OpenAI 设置中关闭余额查询，请到 中转服务的后台"),
+    ({"api_key": KEY, "balance_mode": "relay"}, "官方 API 没有中转服务的额度接口"),
+    ({"api_key": KEY, "balance_key": "sk-admin-全角"}, "管理密钥.*重新复制"),
+    ({"base_url": RELAY}, "管理员还没有配置 OpenAI API Key"),
+    ({"api_key": KEY, "base_url": "ftp://relay.example.com"}, "API 地址无效"),
+])
+def test_balance_missing(section, match):
+    backend = OpenAIBackend(section)
+    assert backend.supports_balance
+    reason = backend.balance_missing()
+    assert re.search(match, reason), reason
+    rec = Recorder(httpx.Response(200, json={}))
+    with pytest.raises(DrawError) as info:
+        run(section, rec, action="balance")
+    assert str(info.value) == reason and not rec.requests
+
+
+@pytest.mark.parametrize(("section", "source"), [
+    ({"api_key": KEY, "balance_key": ADMIN_KEY}, "admin"),
+    ({"balance_key": ADMIN_KEY}, "admin"),  # 管理密钥不需要绘图的 API Key
+    ({"api_key": KEY, "base_url": "https://eu.api.openai.com/v1", "balance_key": f"Bearer {ADMIN_KEY}"}, "admin"),
+    ({"api_key": KEY, "base_url": RELAY}, "relay"),
+    ({"api_key": KEY, "base_url": RELAY, "balance_key": ADMIN_KEY}, "relay"),
+    ({"api_key": KEY, "base_url": RELAY, "balance_mode": "admin", "balance_key": ADMIN_KEY}, "admin"),
+    ({"api_key": KEY, "base_url": RELAY, "balance_mode": "relay"}, "relay"),
+    ({"api_key": KEY, "base_url": RELAY, "balance_mode": "bogus"}, "relay"),
+])
+def test_balance_ready(section, source):
+    backend = OpenAIBackend(section)
+    assert backend.balance_missing() == "" and backend.balance_source() == source
+
+
+# ---------------------------------------------------------------- 余额：官方管理密钥
+
+
+def costs_page(values, has_more=False, next_page=None):
+    return {"object": "page", "has_more": has_more, "next_page": next_page, "data": [
+        {"object": "bucket", "start_time": 1, "end_time": 2, "results": [
+            {"object": "organization.costs.result", "amount": {"value": v, "currency": "usd"}} for v in values]},
+        {"object": "bucket", "start_time": 2, "end_time": 3, "results": []},
+    ]}
+
+
+def admin_handler(pages, limit=None, limit_status=200):
+    pages = list(pages)
+
+    def handler(request):
+        if request.url.path == "/v1/organization/costs":
+            return httpx.Response(200, json=pages.pop(0))
+        if request.url.path == "/v1/organization/spend_limit":
+            return httpx.Response(limit_status, json=limit if limit is not None else {"error": {"message": "no"}})
+        return httpx.Response(404, json={"error": {"message": "unexpected"}})
+
+    return handler
+
+
+def test_balance_admin_costs_and_enforced_limit():
+    pages = [costs_page([1.25, "2.5"], has_more=True, next_page="page_2"), costs_page([0.01, None, "bad"])]
+    limit = {"object": "organization.spend_limit", "threshold_amount": 1000, "currency": "USD",
+             "interval": "month", "enforcement": {"status": "enforcing"}}
+    rec = Recorder(admin_handler(pages, limit))
+    info = run({"api_key": KEY, "balance_key": ADMIN_KEY}, rec, action="balance")
+    assert isinstance(info, BalanceInfo)
+    assert info.items == [("本月已花费（整个组织）", "3.76 美元"), ("每月消费上限（已启用）", "10.00 美元"),
+                          ("距离上限还可花费", "6.24 美元")]
+    assert "不是余额" in info.note and "settings/organization/billing" in info.note
+    assert [r.url.path for r in rec.requests] == ["/v1/organization/costs", "/v1/organization/costs",
+                                                  "/v1/organization/spend_limit"]
+    first, second = rec.requests[0].url.params, rec.requests[1].url.params
+    assert first["start_time"] == str(oai.month_start(datetime.now(timezone.utc)))
+    assert first["bucket_width"] == "1d" and first["limit"] == "31" and "page" not in first
+    assert second["page"] == "page_2"
+    # 只使用管理密钥，不发送绘图的 API Key
+    assert {r.headers["authorization"] for r in rec.requests} == {f"Bearer {ADMIN_KEY}"}
+    assert all(r.method == "GET" and r.url.host == "api.openai.com" for r in rec.requests)
+    assert not any(KEY in str(v) or ADMIN_KEY in str(v) for item in info.items for v in item)
+
+
+def test_month_start():
+    assert oai.month_start(datetime(2026, 10, 25, 13, 5, tzinfo=timezone.utc)) == \
+        int(datetime(2026, 10, 1, tzinfo=timezone.utc).timestamp())
+
+
+def test_balance_admin_limit_not_enforced_or_unavailable():
+    limit = {"threshold_amount": 5000, "enforcement": {"status": "inactive"}}
+    info = run({"balance_key": ADMIN_KEY}, Recorder(admin_handler([costs_page([12])], limit)), action="balance")
+    assert info.items == [("本月已花费（整个组织）", "12.00 美元"), ("每月消费预算（未强制执行）", "50.00 美元")]
+    # 没有设置上限
+    no_limit = {"threshold_amount": 0, "enforcement": {"status": "inactive"}}
+    info = run({"balance_key": ADMIN_KEY}, Recorder(admin_handler([costs_page([])], no_limit)), action="balance")
+    assert info.items == [("本月已花费（整个组织）", "0.00 美元")]
+    # 上限接口失败（403 / 500）不影响消费结果
+    for status in (403, 500):
+        info = run({"balance_key": ADMIN_KEY}, Recorder(admin_handler([costs_page([1])], None, status)),
+                   action="balance")
+        assert info.items == [("本月已花费（整个组织）", "1.00 美元")]
+
+
+def test_balance_admin_key_never_sent_to_relay():
+    rec = Recorder(admin_handler([costs_page([1])], {}))
+    run({"api_key": KEY, "base_url": RELAY, "balance_mode": "admin", "balance_key": ADMIN_KEY}, rec, action="balance")
+    assert {r.url.host for r in rec.requests} == {"api.openai.com"}
+    # 区域官方地址
+    rec = Recorder(lambda request: httpx.Response(200, json=costs_page([1]) if "costs" in request.url.path else {}))
+    run({"base_url": "https://eu.api.openai.com/v1", "balance_key": ADMIN_KEY}, rec, action="balance")
+    assert {r.url.host for r in rec.requests} == {"eu.api.openai.com"}
+    # API 地址误写成 http:// 时，管理密钥仍只通过 https 发送
+    rec = Recorder(lambda request: httpx.Response(200, json=costs_page([1]) if "costs" in request.url.path else {}))
+    run({"base_url": "http://api.openai.com:80/v1", "balance_key": ADMIN_KEY}, rec, action="balance")
+    assert {str(r.url).split("?")[0] for r in rec.requests} == {"https://api.openai.com/v1/organization/costs",
+                                                                "https://api.openai.com/v1/organization/spend_limit"}
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_balance_admin_key_rejected(status, sleeps):
+    rec = Recorder(httpx.Response(status, json={"error": {"message": f"Invalid admin key {ADMIN_KEY}",
+                                                          "code": "invalid_api_key"}}))
+    with pytest.raises(DrawError, match=f"管理密钥（Admin API Key）无效或权限不足（HTTP {status}）.*sk-admin-") as info:
+        run({"api_key": KEY, "balance_key": ADMIN_KEY}, rec, action="balance")
+    assert ADMIN_KEY not in str(info.value) and "9876" in str(info.value)
+    assert len(rec.requests) == 1 and not sleeps
+
+
+def test_balance_admin_costs_retries_rate_limit(sleeps):
+    rec = Recorder(httpx.Response(429, json={"error": {"code": "rate_limit_exceeded"}}),
+                   lambda request: httpx.Response(200, json=costs_page([2]) if "costs" in request.url.path else {}))
+    info = run({"balance_key": ADMIN_KEY}, rec, action="balance")
+    assert info.items[0] == ("本月已花费（整个组织）", "2.00 美元") and len(sleeps) == 1
+
+
+# ---------------------------------------------------------------- 余额：中转服务
+
+
+def relay_handler(routes: dict):
+    def handler(request):
+        item = routes.get(request.url.path)
+        if item is None:
+            return httpx.Response(404, json={"error": {"message": "not found"}})
+        return item(request) if callable(item) else item
+
+    return handler
+
+
+def test_balance_relay_new_api_cny():
+    sub = {"object": "billing_subscription", "has_payment_method": True, "soft_limit_usd": 100.0,
+           "hard_limit_usd": 100.0, "system_hard_limit_usd": 100.0, "access_until": 1798675200}
+    rec = Recorder(relay_handler({
+        "/v1/dashboard/billing/subscription": httpx.Response(200, json=sub),
+        "/v1/dashboard/billing/usage": httpx.Response(200, json={"object": "list", "total_usage": 2534}),
+        "/api/status": httpx.Response(200, json={"success": True, "data": {"quota_per_unit": 500000,
+                                                                           "quota_display_type": "CNY"}}),
+    }))
+    info = run({"api_key": KEY, "base_url": f"{RELAY}/v1/chat/completions"}, rec, action="balance")
+    assert info.items == [("剩余额度", "74.66 元"), ("已用", "25.34 元"), ("总额度", "100.00 元"),
+                          ("令牌有效期至", "2026-12-31")]
+    assert info.note == oai.RELAY_NOTE and "非 OpenAI 官方" in info.note
+    paths = [r.url.path for r in rec.requests]
+    assert paths == ["/v1/dashboard/billing/subscription", "/v1/dashboard/billing/usage", "/api/status"]
+    assert rec.requests[0].headers["authorization"] == f"Bearer {KEY}"
+    assert rec.requests[1].url.params["start_date"].endswith("-01")
+    assert "authorization" not in rec.requests[2].headers  # 公开接口不带 Key
+
+
+def test_balance_relay_unlimited_and_raw_points():
+    routes = {
+        "/v1/dashboard/billing/subscription": httpx.Response(200, json={"hard_limit_usd": 100000000,
+                                                                         "access_until": 0}),
+        "/v1/dashboard/billing/usage": httpx.Response(200, json={"total_usage": 1234}),
+        "/api/status": httpx.Response(500, text="oops"),
+    }
+    info = run({"api_key": KEY, "base_url": RELAY}, Recorder(relay_handler(routes)), action="balance")
+    # 不限额度只针对令牌本身，账户余额可能有限：不能显示成「剩余额度：不限额度」
+    assert info.items == [("令牌额度", "不限额度"), ("已用", "12.34 美元")]
+    assert "账户的剩余额度请到中转服务的后台查看" in info.note and oai.RELAY_NOTE in info.note
+    # one-api 关闭 display_in_currency：返回原始额度点数
+    routes = {
+        "/v1/dashboard/billing/subscription": httpx.Response(200, json={"hard_limit_usd": 600000}),
+        "/v1/dashboard/billing/usage": httpx.Response(200, json={"total_usage": 15000000}),
+        "/api/status": httpx.Response(200, json={"success": True, "data": {"display_in_currency": False}}),
+    }
+    info = run({"api_key": KEY, "base_url": RELAY}, Recorder(relay_handler(routes)), action="balance")
+    assert info.items == [("剩余额度", "450000 额度点数"), ("已用", "150000 额度点数"), ("总额度", "600000 额度点数")]
+
+
+def test_balance_relay_credit_grants_fallback():
+    routes = {"/v1/dashboard/billing/credit_grants": httpx.Response(200, json={
+        "object": "credit_summary", "total_granted": 20, "total_used": 5.5, "total_available": 14.5})}
+    rec = Recorder(relay_handler(routes))
+    info = run({"api_key": KEY, "base_url": RELAY}, rec, action="balance")
+    assert info.items == [("剩余额度", "14.50 美元"), ("已用", "5.50 美元"), ("总额度", "20.00 美元")]
+    assert [r.url.path for r in rec.requests] == ["/v1/dashboard/billing/subscription",
+                                                  "/v1/dashboard/billing/credit_grants"]
+
+
+@pytest.mark.parametrize("resp", [
+    httpx.Response(404, json={"error": {"message": "not found"}}),
+    httpx.Response(501, json={"error": {"code": "api_not_implemented"}}),
+    httpx.Response(200, text="<html><title>Relay Panel</title></html>", headers={"content-type": "text/html"}),
+])
+def test_balance_relay_without_endpoint(resp, sleeps):
+    rec = Recorder(resp)
+    with pytest.raises(DrawError, match="该 API 地址没有提供查询余额的接口"):
+        run({"api_key": KEY, "base_url": RELAY}, rec, action="balance")
+    assert len(rec.requests) == 2 and not sleeps
+
+
+def test_balance_relay_errors(sleeps):
+    # 中转服务以 HTTP 200 返回错误
+    rec = Recorder(httpx.Response(200, json={"error": {"message": "令牌已过期", "type": "new_api_error"}}))
+    with pytest.raises(DrawError, match="查询额度失败：令牌已过期"):
+        run({"api_key": KEY, "base_url": RELAY}, rec, action="balance")
+    # 用量接口出错
+    routes = {"/v1/dashboard/billing/subscription": httpx.Response(200, json={"hard_limit_usd": 5}),
+              "/v1/dashboard/billing/usage": httpx.Response(200, json={"error": {"message": "db error"}})}
+    with pytest.raises(DrawError, match="查询用量失败：db error"):
+        run({"api_key": KEY, "base_url": RELAY}, Recorder(relay_handler(routes)), action="balance")
+    # Key 无效；中转服务原样带出的 Key 打码
+    secret = "sk-relay-secret-ABCDEFGH"
+    rec = Recorder(httpx.Response(401, json={"error": {"message": f"无效的令牌 {secret}"}}))
+    with pytest.raises(DrawError, match="API Key 无效") as info:
+        run({"api_key": secret, "base_url": RELAY}, rec, action="balance")
+    assert secret not in str(info.value) and len(rec.requests) == 1
+    # 反向代理到官方接口
+    rec = Recorder(httpx.Response(403, json={"error": {"message": "Your request to GET /dashboard/billing/subscription "
+                                                                  "must be made with a session key"}}))
+    with pytest.raises(DrawError, match="转发到了 OpenAI 官方接口.*官方管理密钥"):
+        run({"api_key": KEY, "base_url": "https://oai-proxy.example.com"}, rec, action="balance")
+    assert not sleeps
+
+
+def test_balance_relay_connect_error_retried(sleeps):
+    routes = {"/v1/dashboard/billing/subscription": httpx.Response(200, json={"hard_limit_usd": 10}),
+              "/v1/dashboard/billing/usage": httpx.Response(200, json={"total_usage": 100})}
+    calls = []
+
+    def handler(request):
+        calls.append(request.url.path)
+        if len(calls) == 1:
+            raise httpx.ConnectError("refused", request=request)
+        return relay_handler(routes)(request)
+
+    info = run({"api_key": KEY, "base_url": RELAY}, Recorder(handler), action="balance")
+    assert info.items[0] == ("剩余额度", "9.00 美元") and len(sleeps) == 1
+    assert calls[:2] == ["/v1/dashboard/billing/subscription"] * 2
