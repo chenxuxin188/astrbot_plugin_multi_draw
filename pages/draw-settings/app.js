@@ -55,7 +55,15 @@ const PARAM_LABELS = {
   mode: "模式",
   strength: "重绘幅度",
   input_images: "输入图片",
+  usage: "用量",
 };
+// 消耗统计的时间范围：[天数, 名称]，0 表示全部记录
+const USAGE_PERIODS = [
+  [1, "今天"],
+  [7, "7 天"],
+  [30, "30 天"],
+  [0, "全部"],
+];
 const PARAM_VALUES = { mode: { edit: "图片修改", generate: "文生图", text: "文生图" } };
 const FOLLOW_SESSION = "（留空：跟随当前会话）";
 const EMPTY_LABELS = { "persona.vision_provider_id": "（留空：同「生成人格台词使用的 LLM」）" };
@@ -67,6 +75,14 @@ const FEATURED = {
     disabledNote: "开启「评价时附上生成的图片」后才会使用此项。",
   },
 };
+// 各平台的「记录用量」：价格只在开启时用于估算费用
+["openai", "seedream", "xai", "gemini", "sensenova", "comfyui"].forEach((key) => {
+  FEATURED[key + ".track_usage"] = {
+    icon: "wallet",
+    dependents: ["price_per_image", "price_input_per_million", "price_output_per_million", "price_currency"],
+    disabledNote: "开启「记录用量」后才会估算费用。",
+  };
+});
 const SAMPLE_PROMPTS = {
   tags:
     "1girl, solo, long silver hair, blue eyes, school uniform, cherry blossoms, falling petals, smile, " +
@@ -141,6 +157,7 @@ const S = {
   balances: {}, // 平台 key -> { loading, promise, items, note, error, time }
   balanceAll: null, // 「查询全部余额」：{ running, targets, skipped, pending, time }
   audit: { page: 1, data: null, loading: false, error: "", seq: 0, settingsOpen: false },
+  usage: { days: 30, data: null, loading: false, error: "", seq: 0 },
   gallery: {
     list: null,
     loading: false,
@@ -326,7 +343,35 @@ function fmtClock(ms) {
   return pad2(d.getHours()) + ":" + pad2(d.getMinutes()) + ":" + pad2(d.getSeconds());
 }
 
+function fmtInt(n) {
+  return Math.round(Number(n) || 0).toLocaleString("en-US");
+}
+
+/** 与 usage.py 的 format_cost 一致：最多 4 位小数。 */
+function fmtCost(cost, currency, estimated) {
+  const v = Number(cost) || 0;
+  let text = v ? v.toFixed(4).replace(/\.?0+$/, "") : "0";
+  if (text === "0" && v) text = "<0.0001";
+  return ((estimated ? "约 " : "") + text + " " + strOf(currency)).trim();
+}
+
+/** 一次生成的用量：图片数、token 数（有输入 / 输出时一并显示）、平台返回的费用。 */
+function fmtUsage(u) {
+  if (!isObj(u)) return "";
+  const parts = [fmtInt(u.images || 1) + " 张"];
+  if (Number(u.total_tokens) > 0) {
+    let tokens = fmtInt(u.total_tokens) + " tokens";
+    if (Number(u.input_tokens) > 0 || Number(u.output_tokens) > 0) {
+      tokens += "（输入 " + fmtInt(u.input_tokens) + " / 输出 " + fmtInt(u.output_tokens) + "）";
+    }
+    parts.push(tokens);
+  }
+  if (u.cost !== undefined && u.cost !== null && u.currency) parts.push(fmtCost(u.cost, u.currency, false));
+  return parts.join(" · ");
+}
+
 function fmtParam(v, key) {
+  if (key === "usage" && isObj(v)) return fmtUsage(v);
   const names = key ? PARAM_VALUES[key] : null;
   if (names && typeof v === "string" && names[v]) return names[v];
   if (v === true) return "是";
@@ -2132,6 +2177,7 @@ function testResultView(key, r) {
   }
   const chips = h("div", { class: "kv-chips" }, kv("用时", fmtSec(r.elapsed) + " 秒"));
   Object.keys(r.params).forEach((k) => chips.appendChild(kv(PARAM_LABELS[k] || k, fmtParam(r.params[k], k), k)));
+  if (r.cost) chips.appendChild(kv("费用", r.cost, "按平台返回的费用或「记录用量」中配置的价格计算"));
   return h(
     "div",
     { class: "test-result" + (inputs.length ? " is-edit" : "") },
@@ -2202,6 +2248,7 @@ function runTest(key) {
         image: res.image,
         elapsed: isFinite(Number(res.elapsed)) ? Number(res.elapsed) : (Date.now() - t.startedAt) / 1000,
         params: isObj(res.params) ? res.params : {},
+        cost: strOf(res.cost),
         text: strOf(res.text),
         prompt: edit ? text : "",
         inputs,
@@ -2263,9 +2310,16 @@ function renderRecordsPanel(panel) {
     });
     panel.appendChild(card.el);
   });
+  panel.appendChild(usageCard());
+  // 卡片挂到页面上之后再渲染：renderUsage 不处理已经不在页面上的旧卡片
+  if (!S.usage.data && !S.usage.loading) loadUsage();
+  else renderUsage();
   const total = h("span", { class: "muted small" });
   const refresh = h("button", { type: "button", class: "btn btn-sm" }, icon("refresh"), "刷新");
-  refresh.addEventListener("click", () => loadAudit(S.audit.page));
+  refresh.addEventListener("click", () => {
+    loadAudit(S.audit.page);
+    loadUsage();
+  });
   const list = h("div", { class: "records" });
   const pager = h("nav", { class: "pager", "aria-label": "记录分页" });
   panel.appendChild(h("div", { class: "toolbar" }, h("h2", { class: "card-title" }, "绘图记录"), total, h("span", { class: "spacer" }), refresh));
@@ -2274,6 +2328,110 @@ function renderRecordsPanel(panel) {
   S.ui.audit = { list, pager, total, refresh };
   if (!S.audit.data && !S.audit.loading) loadAudit(1);
   else renderAudit();
+}
+
+// ------------------------------------------------------------------ 消耗统计
+
+function usageCard() {
+  const U = S.usage;
+  const buttons = USAGE_PERIODS.map(([days, label]) => {
+    const btn = h("button", { type: "button", class: "seg-btn", "aria-pressed": U.days === days ? "true" : "false" }, label);
+    btn.addEventListener("click", () => {
+      if (U.days === days && U.data) return;
+      U.days = days;
+      buttons.forEach((b, i) => b.setAttribute("aria-pressed", USAGE_PERIODS[i][0] === days ? "true" : "false"));
+      loadUsage();
+    });
+    return btn;
+  });
+  const body = h("div", { class: "usage-body", "aria-live": "polite" });
+  const card = h(
+    "section",
+    { class: "card usage-card" },
+    h(
+      "div",
+      { class: "card-head" },
+      h(
+        "div",
+        null,
+        h("h2", { class: "card-title" }, "消耗统计"),
+        h("p", { class: "card-sub" }, "按绘图记录统计。NovelAI 记录 Anlas 消耗，其他平台记录平台返回的用量；费用的估算价格在各平台设置的「记录用量」中填写。"),
+      ),
+      h("div", { class: "seg", role: "group", "aria-label": "统计范围" }, buttons),
+    ),
+    body,
+  );
+  S.ui.usage = { body };
+  return card;
+}
+
+function loadUsage() {
+  const U = S.usage;
+  const my = ++U.seq;
+  U.loading = true;
+  U.error = "";
+  renderUsage();
+  api("get", "usage", { days: U.days })
+    .then(
+      (res) => {
+        if (my !== U.seq) return;
+        U.data = res;
+      },
+      (e) => {
+        if (my === U.seq) U.error = e.message;
+      },
+    )
+    .then(() => {
+      if (my !== U.seq) return;
+      U.loading = false;
+      renderUsage();
+    });
+}
+
+function usageCells(s) {
+  const tokens = Number(s.total_tokens) > 0 ? fmtInt(s.total_tokens) : "—";
+  const tokenTitle =
+    Number(s.input_tokens) > 0 || Number(s.output_tokens) > 0 ? "输入 " + fmtInt(s.input_tokens) + " / 输出 " + fmtInt(s.output_tokens) : null;
+  const estimated = Array.isArray(s.estimated) ? s.estimated : [];
+  const costs = isObj(s.costs) ? Object.keys(s.costs).map((c) => fmtCost(s.costs[c], c, estimated.indexOf(c) >= 0)) : [];
+  return [
+    h("td", { class: "num" }, fmtInt(s.images)),
+    h("td", { class: "num" }, Number(s.failed) > 0 ? fmtInt(s.failed) : "—"),
+    h("td", { class: "num", title: tokenTitle }, tokens),
+    h("td", { class: "num" }, Number(s.anlas_records) > 0 ? fmtInt(s.anlas) : "—"),
+    h("td", { class: "num" }, costs.length ? costs.join(" + ") : "—"),
+  ];
+}
+
+function renderUsage() {
+  const ui = S.ui.usage;
+  if (!ui || !ui.body.isConnected) return;
+  const U = S.usage;
+  const d = U.data;
+  ui.body.setAttribute("aria-busy", U.loading ? "true" : "false");
+  setChildren(ui.body);
+  if (U.loading && !d) ui.body.appendChild(h("div", { class: "test-status" }, spinner("spinner-sm"), "正在统计…"));
+  if (U.error) {
+    const retry = h("button", { type: "button", class: "link-btn" }, "重试");
+    retry.addEventListener("click", loadUsage);
+    ui.body.appendChild(h("div", { class: "callout callout-error", role: "alert" }, "统计失败：" + U.error + "  ", retry));
+  }
+  if (!d || U.error) return;
+  const rows = Array.isArray(d.backends) ? d.backends.filter(isObj) : [];
+  if (!rows.length) {
+    ui.body.appendChild(h("div", { class: "empty" }, (strOf(d.label) || "这段时间") + "没有绘图记录"));
+    return;
+  }
+  const head = ["平台", "成功（张）", "失败", "Tokens", "Anlas", "费用"].map((t, i) => h("th", { scope: "col", class: i ? "num" : null }, t));
+  const body = rows.map((s) => h("tr", null, h("th", { scope: "row" }, strOf(s.label) || strOf(s.backend)), usageCells(s)));
+  if (rows.length > 1 && isObj(d.total)) body.push(h("tr", { class: "usage-total" }, h("th", { scope: "row" }, "合计"), usageCells(d.total)));
+  ui.body.appendChild(
+    h("div", { class: "bal-table-wrap" }, h("table", { class: "bal-table usage-table", style: U.loading ? "opacity:.6" : null }, h("thead", null, h("tr", null, head)), h("tbody", null, body))),
+  );
+  const notes = [strOf(d.label) + "共 " + fmtInt(d.count) + " 次绘图。"];
+  if (isObj(d.total) && Array.isArray(d.total.estimated) && d.total.estimated.length) notes.push("「约」表示按配置的价格估算，实际以平台账单为准。");
+  if (d.truncated) notes.push("绘图记录有条数上限，更早的记录已被删除，没有计入。");
+  ui.body.appendChild(h("p", { class: "field-hint usage-note" }, notes.join("")));
 }
 
 function loadAudit(page) {
@@ -2401,6 +2559,17 @@ function recordCard(r) {
     add("预计免费", "badge-ok", "Opus 免费额度");
   } else if (r.opus_free === false) {
     add("可能消耗 Anlas", "badge-warn", "Opus 免费额度");
+  }
+  if (isObj(r.usage)) {
+    const u = r.usage;
+    if (Number(u.images) > 1) add(fmtInt(u.images) + " 张", "", "生成的图片数");
+    if (Number(u.total_tokens) > 0) {
+      const detail = Number(u.input_tokens) > 0 || Number(u.output_tokens) > 0 ? "输入 " + fmtInt(u.input_tokens) + " / 输出 " + fmtInt(u.output_tokens) : "";
+      add(fmtInt(u.total_tokens) + " tokens", "", detail || "Token 用量");
+    }
+  }
+  if (r.cost !== undefined && r.cost !== null && r.currency) {
+    add(fmtCost(r.cost, r.currency, r.cost_estimated), "badge-warn", r.cost_estimated ? "按配置的价格估算的费用" : "平台返回的实际费用");
   }
   const card = h("article", { class: "rec" + (ok ? "" : " is-failed") }, head, meta.children.length ? meta : null);
   if (!ok) {

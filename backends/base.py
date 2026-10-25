@@ -253,6 +253,36 @@ def image_result(data: bytes, params: dict, text: str = "") -> DrawResult:
     return DrawResult(image=data, mime=detect_mime(data) or "image/png", params=params, text=text)
 
 
+def _count(value) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = int(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if number >= 0 else None
+
+
+def usage_of(images=1, input_tokens=None, output_tokens=None, total_tokens=None,
+             cost: float | None = None, currency: str = "") -> dict:
+    """把平台响应中的用量整理成统一格式，作为 params["usage"] 写入绘图记录。
+
+    images 为生成的图片数；*_tokens 为平台返回的 token 数（按 token 计费的平台）；
+    cost / currency 为平台直接返回的本次费用（目前只有 xAI）。没有返回的项不写入。
+    """
+    usage: dict = {"images": _count(images) or 1}
+    for key, value in (("input_tokens", input_tokens), ("output_tokens", output_tokens),
+                       ("total_tokens", total_tokens)):
+        number = _count(value)
+        if number is not None:
+            usage[key] = number
+    if "total_tokens" not in usage and ("input_tokens" in usage or "output_tokens" in usage):
+        usage["total_tokens"] = usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+    if isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost >= 0 and currency:
+        usage.update(cost=round(float(cost), 6), currency=currency)
+    return usage
+
+
 # ---------------------------------------------------------------- HTTP
 
 

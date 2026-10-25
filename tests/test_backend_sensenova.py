@@ -133,7 +133,7 @@ def test_request_per_orientation(orientation, size):
     }
     assert result.image == PNG and result.mime == "image/png"
     assert result.params == {"model": "sensenova-u1.5-lite", "size": size, "output_format": "png",
-                             "watermark": False, "prompt_extend": True, "tokens": 5636}
+                             "watermark": False, "prompt_extend": True, "usage": {"images": 1, "total_tokens": 5636}}
     assert len(rec.requests) == 1
 
 
@@ -589,7 +589,7 @@ def test_edit_request_shape():
     assert result.image == PNG and result.mime == "image/png"
     assert result.params == {"mode": "edit", "model": "sensenova-u1.5-lite", "size": "1664x2496",
                              "output_format": "png", "watermark": False, "prompt_extend": True,
-                             "input_images": 2, "tokens": 12881}
+                             "input_images": 2, "usage": {"images": 1, "total_tokens": 12881}}
 
 
 @pytest.mark.parametrize("strength", [0.0, 0.05, 0.4, 0.99, 1.0])
@@ -993,7 +993,7 @@ def test_schema_defaults_produce_valid_request():
     items = section["items"]
     assert list(items) == ["api_key", "base_url", "proxy_url", "model", "portrait_size", "landscape_size",
                            "square_size", "edit_size", "watermark", "prompt_extend", "output_format", "timeout",
-                           "extra_body"]
+                           "extra_body", "track_usage", "price_per_image", "price_currency"]
     for name, field in items.items():
         assert field["type"] in ("string", "text", "int", "float", "bool", "list"), name
         assert field.get("description") and field.get("hint"), name

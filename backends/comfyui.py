@@ -48,6 +48,7 @@ from .base import (
     parse_size,
     response_detail,
     send,
+    usage_of,
     with_retries,
 )
 
@@ -855,9 +856,10 @@ class ComfyUIBackend(Backend):
 
     async def generate(self, clients: Clients, req: DrawRequest) -> DrawResult:
         try:
-            if req.is_edit:
-                return await self._edit(clients.http, req)
-            return await self._generate(clients.http, req)
+            result = await (self._edit if req.is_edit else self._generate)(clients.http, req)
+            # ComfyUI 不返回用量：本地不计费，Comfy Cloud 可以在配置中按张估算费用
+            result.params["usage"] = usage_of()
+            return result
         except DrawError as e:
             if not (e.retryable and e.status is None and not self.cloud):
                 raise

@@ -38,6 +38,7 @@ from .base import (
     parse_size,
     response_detail,
     send,
+    usage_of,
     with_retries,
 )
 
@@ -424,8 +425,8 @@ class SenseNovaBackend(Backend):
             if len(req.images) > MAX_EDIT_IMAGES:
                 # 文档最多 5 张，多出的图片没有发送
                 params["ignored_images"] = len(req.images) - MAX_EDIT_IMAGES
-        if usage.get("total_tokens") is not None:
-            params["tokens"] = usage["total_tokens"]
+        params["usage"] = usage_of(usage.get("images_count") or 1, usage.get("input_tokens"),
+                                   usage.get("output_tokens"), usage.get("total_tokens"))
         return image_result(image, params)
 
     def plan(self, req: DrawRequest) -> dict:

@@ -216,6 +216,7 @@ def test_default_workflow_request(orientation, size):
     assert result.params == {
         "model": CHECKPOINTS[0], "size": f"{size[0]}x{size[1]}", "seed": 42, "workflow": "builtin",
         "prompt_id": body["prompt_id"], "steps": 25, "cfg": 7.0, "sampler": "dpmpp_2m", "scheduler": "karras",
+        "usage": {"images": 1},
     }
 
 
@@ -993,7 +994,7 @@ def test_edit_builtin_img2img_request_shape():
     assert result.params == {
         "mode": "edit", "model": CHECKPOINTS[0], "size": "1232x816", "seed": 42, "input_images": 1,
         "workflow": "builtin-img2img", "prompt_id": pid, "strength": 0.45, "steps": 25, "cfg": 7.0,
-        "sampler": "dpmpp_2m", "scheduler": "karras",
+        "sampler": "dpmpp_2m", "scheduler": "karras", "usage": {"images": 1},
     }
 
 
@@ -1111,7 +1112,8 @@ def test_edit_custom_multi_image_workflow_prunes_unused_slots():
     assert "ImageCompositeMasked" not in json.dumps(graph)  # 自定义工作流不插入白底合成节点
     assert "/models/checkpoints" not in fake.paths() and fake.object_info_calls > 0
     assert result.params == {"mode": "edit", "model": "", "size": "1216x832", "seed": 42, "input_images": 2,
-                             "workflow": "custom-edit", "prompt_id": fake.bodies[0]["prompt_id"]}
+                             "workflow": "custom-edit", "prompt_id": fake.bodies[0]["prompt_id"],
+                             "usage": {"images": 1}}
 
     # /object_info 的结果有缓存：再次修改不重复查询
     fake = FakeComfy()
@@ -1493,7 +1495,7 @@ def test_schema_section_matches_code():
     keys = list(items)
     assert keys[:7] == ["api_key", "base_url", "proxy_url", "model", "portrait_size", "landscape_size",
                         "square_size"]
-    assert keys[-2:] == ["timeout", "extra_body"]
+    assert keys[-5:] == ["timeout", "extra_body", "track_usage", "price_per_image", "price_currency"]
     for name, field in items.items():
         assert field["type"] in ("string", "text", "int", "float", "bool", "list"), name
         assert field["description"] and field["hint"], name

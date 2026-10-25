@@ -58,7 +58,7 @@ def env(tmp_path):
     config = astrbot_stub.AstrBotConfig(defaults(schema))
     config["admin_ids"] = ["10001"]
     config["novelai"]["token"] = "pst-secret-token-1234"
-    config["audit"]["track_anlas"] = False
+    config["novelai"]["track_anlas"] = False
     return main, config, tmp_path
 
 
@@ -243,7 +243,7 @@ def test_web_api(env):
     main, config, tmp = env
     plugin, ctx = make_plugin(main, config, lambda r: httpx.Response(200, content=make_zip()))
     routes = {r[0].rsplit("/", 1)[-1]: r[1] for r in ctx.registered_web_apis}
-    assert set(routes) == {"state", "config", "test", "models", "balance", "audit", "images", "image"}
+    assert set(routes) == {"state", "config", "test", "models", "balance", "audit", "usage", "images", "image"}
     req = astrbot_stub.request
 
     async def go():
@@ -802,3 +802,121 @@ def test_state_reports_edit_prompt_mode(env):
     routes = {r[0].rsplit("/", 1)[-1]: r[1] for r in ctx.registered_web_apis}
     comfy = next(b for b in run(routes["state"]())["backends"] if b["key"] == "comfyui")
     assert comfy["prompt_mode"] == "tags" and comfy["edit_prompt_mode"] == "natural"
+
+
+def openai_usage_handler(usage):
+    def handler(request):
+        assert request.url.path == "/v1/images/generations"
+        return httpx.Response(200, json={"data": [{"b64_json": base64.b64encode(PNG).decode()}], "usage": usage})
+
+    return handler
+
+
+async def collect_results(agen):
+    return [r async for r in agen]
+
+
+def test_usage_recorded_with_token_price_and_summarized(env):
+    main, config, tmp = env
+    config["draw"]["backend"] = "openai"
+    config["openai"].update(api_key="sk-test-abcdefgh", price_input_per_million=5.0, price_output_per_million=40.0)
+    usage = {"input_tokens": 100, "output_tokens": 4160, "total_tokens": 4260}
+    plugin, ctx = make_plugin(main, config, openai_usage_handler(usage))
+    alice = astrbot_stub.AstrMessageEvent(sender="10001")
+    bob = astrbot_stub.AstrMessageEvent(sender="20002")
+
+    async def go():
+        await plugin._draw_flow(alice, "画一只猫", "", "llm")
+        await plugin._draw_flow(bob, "画一只狗", "", "llm")
+        return (await plugin.audit.page(1, 10))[0]
+
+    records = run(go())
+    rec = records[0]
+    assert rec["usage"] == {"images": 1, "input_tokens": 100, "output_tokens": 4160, "total_tokens": 4260}
+    assert rec["cost"] == 0.16690 and rec["currency"] == "USD" and rec["cost_estimated"] is True
+    assert "4,260 tokens" in main.format_record(rec) and "约 0.1669 USD" in main.format_record(rec)
+
+    admin_text = run(collect_results(plugin.draw_usage(alice, "7")))[0][0].text
+    assert "最近 7 天" in admin_text and "共 2 次绘图" in admin_text and "成功 2 张" in admin_text
+    assert "8,520 tokens" in admin_text and "约 0.3338 USD" in admin_text
+    own = run(collect_results(plugin.draw_usage(bob, "all", "openai")))[0][0].text
+    assert own.startswith("你的OpenAI") and "全部记录" in own and "共 1 次绘图" in own
+    bad = run(collect_results(plugin.draw_usage(bob, "whatever")))[0][0].text
+    assert "无法识别" in bad
+
+    # LLM 工具：管理员看到所有人，非管理员只看到自己的，且没有余额
+    text = run(plugin.draw_usage_tool(alice, days=1))
+    assert "今天" in text and "共 2 次绘图" in text
+    text = run(plugin.draw_usage_tool(bob, days=1, platform="gpt"))
+    assert "共 1 次绘图" in text and "只有管理员" in text
+    assert "没有名为" in run(plugin.draw_usage_tool(alice, days=1, platform="midjourney"))
+
+    routes = {r[0].rsplit("/", 1)[-1]: r[1] for r in ctx.registered_web_apis}
+    astrbot_stub.request.query = {"days": "0"}
+    out = run(routes["usage"]())
+    assert out["count"] == 2 and out["label"] == "全部记录" and out["since"] == ""
+    row = out["backends"][0]
+    assert row["backend"] == "openai" and row["images"] == 2 and row["costs"] == {"USD": 0.3338}
+    assert row["estimated"] == ["USD"] and out["total"]["total_tokens"] == 8520
+    astrbot_stub.request.query = {"backend": "nope"}
+    assert run(routes["usage"]())["status"] == "error"
+    astrbot_stub.request.query = {}
+    # 试画也显示用量和按（未保存的）设置估算的费用
+    astrbot_stub.request.body = {"backend": "openai", "prompt": "a cat",
+                                 "section": {"price_input_per_million": 10, "price_output_per_million": 50}}
+    out = run(routes["test"]())
+    assert out["params"]["usage"]["total_tokens"] == 4260 and out["cost"] == "约 0.209 USD"
+    run(plugin.terminate())
+
+
+def test_usage_off_and_per_image_price(env):
+    main, config, tmp = env
+    config["draw"]["backend"] = "openai"
+    config["openai"].update(api_key="sk-test-abcdefgh", track_usage=False, price_per_image=0.2)
+    plugin, ctx = make_plugin(main, config, openai_usage_handler({"total_tokens": 900}))
+    event = astrbot_stub.AstrMessageEvent()
+
+    async def go():
+        await plugin._draw_flow(event, "画一只猫", "", "llm")
+        config["openai"]["track_usage"] = True
+        config["openai"]["price_currency"] = "元"
+        await plugin._draw_flow(event, "画一只狗", "", "llm")
+        return (await plugin.audit.page(1, 10))[0]
+
+    newest, oldest = run(go())
+    assert "usage" not in oldest and "cost" not in oldest
+    # 只有总 token 数、没有输入 / 输出 token 时按张估算
+    assert newest["usage"] == {"images": 1, "total_tokens": 900}
+    assert newest["cost"] == 0.2 and newest["currency"] == "元" and newest["cost_estimated"] is True
+    text = run(plugin.usage_text(0))
+    assert "成功 2 张" in text and "约 0.2 元" in text
+
+
+def test_anlas_tracking_setting_in_novelai_section(env, monkeypatch):
+    main, config, tmp = env
+    monkeypatch.setattr(main, "ANLAS_SETTLE_SECONDS", 0)
+    config["novelai"]["track_anlas"] = True
+    balance = {"anlas": 1000}
+
+    def handler(request):
+        if request.url.path == "/user/subscription":
+            return httpx.Response(200, json={"tier": 3, "active": True, "trainingStepsLeft": {
+                "fixedTrainingStepsLeft": balance["anlas"], "purchasedTrainingSteps": 0}})
+        balance["anlas"] -= 17
+        return nai_ok(request)
+
+    plugin, ctx = make_plugin(main, config, handler)
+    event = astrbot_stub.AstrMessageEvent()
+
+    async def go():
+        await plugin._draw_flow(event, "画一个猫娘", "", "llm")
+        return (await plugin.audit.page(1, 10))[0][0]
+
+    rec = run(go())
+    assert rec["anlas_before"] == 1000 and rec["anlas_after"] == 983 and rec["anlas_cost"] == 17
+    assert "usage" not in rec
+    text = run(plugin.usage_text(1))
+    assert "【NovelAI】成功 1 张；消耗 17 Anlas" in text
+
+    run(plugin.terminate())
+

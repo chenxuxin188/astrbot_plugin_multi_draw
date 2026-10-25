@@ -6,7 +6,7 @@
       "type": "string"
     },
     "default": [],
-    "hint": "列表中的用户可以使用 /draw use 切换绘图平台、/draw account 查询 NovelAI 余额、/draw audit 查看绘图记录。"
+    "hint": "列表中的用户可以使用 /draw use 切换绘图平台、/draw balance 查询余额、/draw audit 查看绘图记录、/draw usage 查看所有人的消耗统计；其他用户只能查看自己的消耗。"
   },
   "draw": {
     "description": "通用绘图设置",
@@ -236,6 +236,12 @@
         "default": true,
         "hint": "开启后自动把尺寸缩小到总像素 ≤ 1024×1024、步数限制在 28 以内。Opus 会员使用 V4.5 及以下模型时不消耗 Anlas；V5 模型不受此开关保护，仍会消耗 Opus 用量条，用尽后扣 Anlas。修改图片时输出尺寸按原图比例，像素数不超过对应方向配置的尺寸（开启时同样 ≤ 1024×1024；关闭时最多为官方上限 3145728 像素），但图生图可能不在免费范围内。"
       },
+      "track_anlas": {
+        "description": "记录 Anlas 消耗",
+        "type": "bool",
+        "default": true,
+        "hint": "每次生成前后各查询一次 Anlas 余额，把差值作为本次消耗写入绘图记录（生成失败也会记录，失败的请求也可能扣费）。可以用 /draw usage 或「绘图设置」页面的「记录」查看统计，Bot 也能通过 LLM 工具 draw_usage 查询。每次生成会多两次余额查询，生成后约等 1.5 秒再查询，以便扣费结算完成。"
+      },
       "edit_noise": {
         "description": "修改图片的噪声（noise）",
         "type": "float",
@@ -458,6 +464,36 @@
         "default": "",
         "secret": true,
         "hint": "可选，OpenAI Admin API Key（sk-admin- 开头），只用于在官方 API 上查询本月已花费的金额和消费上限，不能用于绘图，也只会通过 https 发送给 OpenAI 官方地址（api.openai.com 或 eu.api.openai.com 等区域地址），不会发送给中转服务。需要组织 Owner 在 platform.openai.com → Settings → Organization → Admin keys 创建；管理密钥权限很大，如果创建时可以选择只读（Read only）权限请选只读，并妥善保管。使用中转服务时不需要填写。"
+      },
+      "track_usage": {
+        "description": "记录用量",
+        "type": "bool",
+        "default": true,
+        "hint": "每次生成后把响应中的 token 数（GPT Image 按输入和输出 token 计费；部分中转服务不返回）和估算的费用写入绘图记录。可以用 /draw usage 或「绘图设置」页面的「记录」查看统计，Bot 也能通过 LLM 工具 draw_usage 回答「今天画了多少、花了多少」。关闭后只记录绘图参数。"
+      },
+      "price_per_image": {
+        "description": "每张图片的价格（估算费用）",
+        "type": "float",
+        "default": 0.0,
+        "hint": "每生成一张图片的价格，按下面的货币单位记账，用于估算费用。填 0 表示不估算。GPT Image 按 token 计费，同一模型的价格随质量和尺寸变化；填写下面的 token 价格可以算得更准。"
+      },
+      "price_input_per_million": {
+        "description": "每百万输入 token 的价格",
+        "type": "float",
+        "default": 0.0,
+        "hint": "按 token 估算费用：每 100 万输入 token（提示词和输入图片）的价格。输入、输出价格都填写后按响应中的 token 数计算，比按张估算更准确；响应中没有 token 数时改用「每张图片的价格」。文字和图片输入的单价可能不同，这里按一个价格估算。官方价格见 https://platform.openai.com/docs/pricing。"
+      },
+      "price_output_per_million": {
+        "description": "每百万输出 token 的价格",
+        "type": "float",
+        "default": 0.0,
+        "hint": "每 100 万输出 token（生成的图片）的价格，与上面的输入价格一起使用。"
+      },
+      "price_currency": {
+        "description": "价格的货币单位",
+        "type": "string",
+        "default": "USD",
+        "hint": "只用于显示，不同单位的费用分开统计，例如 USD、元。使用中转服务时填写中转服务的计价单位。"
       }
     }
   },
@@ -633,6 +669,24 @@
         "type": "string",
         "default": "",
         "hint": "仅用于查询余额。一般留空：火山引擎使用 cn-beijing，BytePlus 使用 ap-singapore-1。只有余额查询提示签名或地域错误时才需要修改（BytePlus 可以试试 ap-southeast-1），填地域 ID（小写字母、数字和连字符）。"
+      },
+      "track_usage": {
+        "description": "记录用量",
+        "type": "bool",
+        "default": true,
+        "hint": "每次生成后把生成的图片张数和 token 数（Seedream 按成功生成的图片张数计费）和估算的费用写入绘图记录。可以用 /draw usage 或「绘图设置」页面的「记录」查看统计，Bot 也能通过 LLM 工具 draw_usage 回答「今天画了多少、花了多少」。关闭后只记录绘图参数。"
+      },
+      "price_per_image": {
+        "description": "每张图片的价格（估算费用）",
+        "type": "float",
+        "default": 0.0,
+        "hint": "每生成一张图片的价格，按下面的货币单位记账，用于估算费用。填 0 表示不估算。各模型的单价见火山方舟文档中的模型价格说明。"
+      },
+      "price_currency": {
+        "description": "价格的货币单位",
+        "type": "string",
+        "default": "元",
+        "hint": "只用于显示，不同单位的费用分开统计，例如 USD、元。使用中转服务时填写中转服务的计价单位。"
       }
     }
   },
@@ -741,6 +795,24 @@
         "type": "string",
         "default": "",
         "hint": "可选，只在查询余额时使用，一般留空：使用官方 API 地址时先用 API Key 自动获取，获取不到时使用管理密钥所属的团队。需要指定时填写 xAI 控制台团队设置中的团队 ID（UUID 格式，形如 xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx）。"
+      },
+      "track_usage": {
+        "description": "记录用量",
+        "type": "bool",
+        "default": true,
+        "hint": "每次生成后把平台返回的实际费用（xAI 在响应中直接给出本次花费的美元数）和估算的费用写入绘图记录。可以用 /draw usage 或「绘图设置」页面的「记录」查看统计，Bot 也能通过 LLM 工具 draw_usage 回答「今天画了多少、花了多少」。关闭后只记录绘图参数。"
+      },
+      "price_per_image": {
+        "description": "每张图片的价格（估算费用）",
+        "type": "float",
+        "default": 0.0,
+        "hint": "每生成一张图片的价格，按下面的货币单位记账，用于估算费用。填 0 表示不估算。xAI 官方接口会直接返回实际费用，优先使用它；只有中转服务等没有返回费用时才按这里估算。"
+      },
+      "price_currency": {
+        "description": "价格的货币单位",
+        "type": "string",
+        "default": "USD",
+        "hint": "只用于显示，不同单位的费用分开统计，例如 USD、元。使用中转服务时填写中转服务的计价单位。"
       }
     }
   },
@@ -858,6 +930,36 @@
         "editor_mode": true,
         "editor_language": "json",
         "hint": "可选，JSON 对象，最后合并进请求体（对象逐层合并，值为 null 表示删除该字段），可以覆盖上面的参数，例如 {\"safetySettings\": [{\"category\": \"HARM_CATEGORY_SEXUALLY_EXPLICIT\", \"threshold\": \"BLOCK_ONLY_HIGH\"}]}。按所选接口的格式填写；自动模式下按 generateContent 格式，回退到 Interactions 时不附加。"
+      },
+      "track_usage": {
+        "description": "记录用量",
+        "type": "bool",
+        "default": true,
+        "hint": "每次生成后把响应中的输入、输出 token 数（Gemini 按 token 计费，思考 token 按输出计费）和估算的费用写入绘图记录。可以用 /draw usage 或「绘图设置」页面的「记录」查看统计，Bot 也能通过 LLM 工具 draw_usage 回答「今天画了多少、花了多少」。关闭后只记录绘图参数。"
+      },
+      "price_per_image": {
+        "description": "每张图片的价格（估算费用）",
+        "type": "float",
+        "default": 0.0,
+        "hint": "每生成一张图片的价格，按下面的货币单位记账，用于估算费用。填 0 表示不估算。Gemini 按 token 计费，每张图的输出 token 数取决于分辨率；填写下面的 token 价格可以算得更准。"
+      },
+      "price_input_per_million": {
+        "description": "每百万输入 token 的价格",
+        "type": "float",
+        "default": 0.0,
+        "hint": "按 token 估算费用：每 100 万输入 token（提示词和输入图片）的价格。输入、输出价格都填写后按响应中的 token 数计算，比按张估算更准确；响应中没有 token 数时改用「每张图片的价格」。文字和图片输入的单价可能不同，这里按一个价格估算。官方价格见 https://ai.google.dev/gemini-api/docs/pricing。"
+      },
+      "price_output_per_million": {
+        "description": "每百万输出 token 的价格",
+        "type": "float",
+        "default": 0.0,
+        "hint": "每 100 万输出 token（生成的图片和思考过程）的价格，与上面的输入价格一起使用。"
+      },
+      "price_currency": {
+        "description": "价格的货币单位",
+        "type": "string",
+        "default": "USD",
+        "hint": "只用于显示，不同单位的费用分开统计，例如 USD、元。使用中转服务时填写中转服务的计价单位。"
       }
     }
   },
@@ -955,6 +1057,24 @@
         "editor_mode": true,
         "editor_language": "json",
         "hint": "可选，JSON 对象，最后合并进请求体（画图和修改图片都会使用），可以覆盖上面的参数，例如 {\"output_format\": \"webp\"}。这里填写的值按原样发送，不会自动调整；修改图片时其中的 images、image、mask、prompt、size、n 会被忽略。不要添加 negative_prompt、seed、n 等文档中没有的字段，可能导致请求失败。"
+      },
+      "track_usage": {
+        "description": "记录用量",
+        "type": "bool",
+        "default": true,
+        "hint": "每次生成后把生成的图片张数和响应中的 token 数和估算的费用写入绘图记录。可以用 /draw usage 或「绘图设置」页面的「记录」查看统计，Bot 也能通过 LLM 工具 draw_usage 回答「今天画了多少、花了多少」。关闭后只记录绘图参数。"
+      },
+      "price_per_image": {
+        "description": "每张图片的价格（估算费用）",
+        "type": "float",
+        "default": 0.0,
+        "hint": "每生成一张图片的价格，按下面的货币单位记账，用于估算费用。填 0 表示不估算。价格见商汤日日新开放平台的计费说明。"
+      },
+      "price_currency": {
+        "description": "价格的货币单位",
+        "type": "string",
+        "default": "元",
+        "hint": "只用于显示，不同单位的费用分开统计，例如 USD、元。使用中转服务时填写中转服务的计价单位。"
       }
     }
   },
@@ -1100,6 +1220,24 @@
         "editor_mode": true,
         "editor_language": "json",
         "hint": "JSON 对象，最后合并到提交工作流的请求体（POST /prompt）中，可以覆盖同名字段。例如本地 ComfyUI 使用付费 API 节点时填 {\"extra_data\": {\"api_key_comfy_org\": \"comfyui-...\"}}（填写后本地 ComfyUI 也可以用这个 Key 查询 comfy.org 的积分余额；Comfy Cloud 会自动带上上面的 API Key，不用填写）；填 {\"front\": true} 插到队列最前（Comfy Cloud 会忽略）。留空则不添加。"
+      },
+      "track_usage": {
+        "description": "记录用量",
+        "type": "bool",
+        "default": true,
+        "hint": "每次生成后把生成的图片张数（本地 ComfyUI 不计费）和估算的费用写入绘图记录。可以用 /draw usage 或「绘图设置」页面的「记录」查看统计，Bot 也能通过 LLM 工具 draw_usage 回答「今天画了多少、花了多少」。关闭后只记录绘图参数。"
+      },
+      "price_per_image": {
+        "description": "每张图片的价格（估算费用）",
+        "type": "float",
+        "default": 0.0,
+        "hint": "每生成一张图片的价格，按下面的货币单位记账，用于估算费用。填 0 表示不估算。本地 ComfyUI 不计费，保持 0 即可；Comfy Cloud 按 GPU 用时扣积分，可以填写每张图的大致花费。"
+      },
+      "price_currency": {
+        "description": "价格的货币单位",
+        "type": "string",
+        "default": "USD",
+        "hint": "只用于显示，不同单位的费用分开统计，例如 USD、元。使用中转服务时填写中转服务的计价单位。"
       }
     }
   },
@@ -1212,12 +1350,6 @@
     "description": "绘图记录",
     "type": "object",
     "items": {
-      "track_anlas": {
-        "description": "记录 Anlas 消耗（NovelAI）",
-        "type": "bool",
-        "default": true,
-        "hint": "使用 NovelAI 时，每次生成前后各查询一次余额并记录差值。"
-      },
       "page_size": {
         "description": "/draw audit 每页条数",
         "type": "int",

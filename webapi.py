@@ -28,6 +28,7 @@ from .backends.base import (
     DrawError,
     DrawRequest,
     InputImage,
+    as_bool,
     as_float,
     as_int,
     as_str,
@@ -36,6 +37,7 @@ from .backends.base import (
 )
 from .imaging import normalize_input
 from .settings import draft_section, load_schema, masked_config, merge_config
+from .usage import estimate_cost, format_cost, period_label, period_start, summarize
 
 try:  # AstrBot >= 4.26
     from astrbot.api.web import request
@@ -95,6 +97,7 @@ class WebApi:
             ("models", self.models, ["POST"], "绘图设置：获取模型列表"),
             ("balance", self.balance, ["POST"], "绘图设置：查询余额"),
             ("audit", self.audit, ["GET"], "绘图设置：绘图记录"),
+            ("usage", self.usage, ["GET"], "绘图设置：消耗统计"),
             ("images", self.images, ["GET"], "绘图设置：图库列表"),
             ("image", self.image, ["GET"], "绘图设置：读取图片"),
         ]
@@ -266,11 +269,18 @@ class WebApi:
         except Exception as e:
             logger.warning(f"{LOG_PREFIX} 试画失败（{backend.label}）：{_err_text(e)}")
             return _error(f"试画失败：{_err_text(e)}")
+        cost = ""
+        usage = result.params.get("usage")
+        if isinstance(usage, dict) and as_bool(backend.section.get("track_usage"), True):
+            amount, currency, estimated = estimate_cost(usage, backend.section)
+            if amount is not None:
+                cost = format_cost(amount, currency, estimated)
         return {
             "image": _data_url(result.image, result.mime),
             "mime": result.mime,
             "elapsed": round(time.monotonic() - started, 1),
             "params": result.params,
+            "cost": cost,
             "text": result.text[:2000],
         }
 
@@ -337,6 +347,20 @@ class WebApi:
         page_size = as_int(_query("page_size", "20"), 20, 1, 100)
         records, page, pages, total = await self.plugin.audit.page(page, page_size)
         return {"records": records, "page": page, "pages": pages, "total": total}
+
+    async def usage(self, **_):
+        if self.plugin._closing:
+            return _error("插件已停用或正在重载，请刷新页面后重试")
+        days = as_int(_query("days", "30"), 30, 0, 3650)
+        backend = _query("backend")
+        if backend and backend not in BACKENDS:
+            return _error(f"未知的绘图平台：{backend}")
+        since = period_start(days)
+        records = await self.plugin.audit.records()
+        trimmed = await self.plugin.audit.trimmed_until()
+        summary = summarize(records, since, None, backend or None, BACKEND_ORDER, trimmed)
+        summary.update(days=days, label=period_label(days), since=since.isoformat() if since else "")
+        return summary
 
     async def images(self, **_):
         if self.plugin._closing:

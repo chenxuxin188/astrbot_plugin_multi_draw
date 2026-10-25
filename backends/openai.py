@@ -43,6 +43,7 @@ from .base import (
     parse_size,
     response_detail,
     send,
+    usage_of,
     with_retries,
 )
 
@@ -618,9 +619,11 @@ class OpenAIBackend(Backend):
         for key in ("moderation", "background", "response_format"):
             if body.get(key):
                 params[key] = as_str(body[key])
-        usage = data.get("usage")  # 官方文档标注 usage 不一定返回
-        if isinstance(usage, dict) and usage.get("total_tokens") is not None:
-            params["tokens"] = as_int(usage.get("total_tokens"), 0)
+        usage = data.get("usage")  # 官方文档标注 usage 不一定返回；GPT Image 按输入、输出 token 计费
+        usage = usage if isinstance(usage, dict) else {}
+        items = data.get("data")
+        params["usage"] = usage_of(len(items) if isinstance(items, list) else 1, usage.get("input_tokens"),
+                                   usage.get("output_tokens"), usage.get("total_tokens"))
         return params
 
     async def generate(self, clients: Clients, req: DrawRequest) -> DrawResult:

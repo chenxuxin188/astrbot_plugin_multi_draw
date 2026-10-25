@@ -187,7 +187,8 @@ def test_default_request_per_orientation(orientation, size):
     }
     assert result.image == PNG and result.mime == "image/png" and result.text == ""
     assert result.params == {"model": DEFAULT_MODEL, "size": "1664x2496", "watermark": False,
-                             "output_format": "jpeg", "request_id": "req-1"}
+                             "output_format": "jpeg", "request_id": "req-1",
+                             "usage": {"images": 1, "output_tokens": 16224, "total_tokens": 16224}}
 
 
 FAST = {"optimize_prompt_options": {"mode": "fast"}}
@@ -642,7 +643,8 @@ def test_schema_defaults_match_code_and_produce_valid_requests():
     assert list(items) == ["api_key", "base_url", "proxy_url", "model", "portrait_size", "landscape_size",
                            "square_size", "model_family", "output_format", "optimize_mode", "watermark",
                            "edit_size_mode", "keep_transparency", "timeout", "extra_body",
-                           "access_key_id", "secret_access_key", "billing_platform", "billing_region"]
+                           "access_key_id", "secret_access_key", "billing_platform", "billing_region",
+                           "track_usage", "price_per_image", "price_currency"]
     for name, field in items.items():
         assert field["type"] in ("string", "text", "int", "float", "bool", "list"), name
         assert field.get("description") and field.get("hint"), name
@@ -781,7 +783,8 @@ def test_edit_single_image_request_and_result():
     assert_valid_edit(body, "5.0-pro")
     assert result.image == PNG and result.mime == "image/png"
     assert result.params == {"model": DEFAULT_MODEL, "size": "1664x2496", "watermark": False, "output_format": "jpeg",
-                             "mode": "edit", "input_images": 1, "request_id": "req-9"}
+                             "mode": "edit", "input_images": 1, "request_id": "req-9",
+                             "usage": {"images": 1, "output_tokens": 16224, "total_tokens": 16224}}
 
 
 def test_edit_multi_image_order_and_formats():
@@ -796,7 +799,8 @@ def test_edit_multi_image_order_and_formats():
     assert "output_format" not in body  # 4.5 不接受
     assert_valid_edit(body, "4.5")
     assert result.params == {"model": "doubao-seedream-4-5-251128", "size": "2048x2048", "watermark": False,
-                             "mode": "edit", "input_images": 2}
+                             "mode": "edit", "input_images": 2,
+                             "usage": {"images": 1, "output_tokens": 16224, "total_tokens": 16224}}
 
 
 @pytest.mark.parametrize(

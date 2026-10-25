@@ -42,6 +42,7 @@ from .base import (
     parse_size,
     response_detail,
     send,
+    usage_of,
     with_retries,
 )
 
@@ -375,6 +376,25 @@ def parse_interaction(data: dict) -> tuple[dict, str]:
     raise _no_image(code, detail, as_str(data.get("status")))
 
 
+def gemini_usage(data: dict) -> dict:
+    """用量：generateContent 的 usageMetadata，或 Interactions 的 usage。
+
+    思考 token 按输出价格计费，计入输出 token（candidatesTokenCount 不含思考 token）。
+    """
+    meta = data.get("usageMetadata")
+    if isinstance(meta, dict):
+        fields = ("promptTokenCount", "candidatesTokenCount", "thoughtsTokenCount", "totalTokenCount")
+    else:
+        meta = data.get("usage")
+        fields = ("total_input_tokens", "total_output_tokens", "total_thought_tokens", "total_tokens")
+    if not isinstance(meta, dict):
+        return usage_of()
+    prompt, output, thoughts, total = (meta.get(f) for f in fields)
+    if isinstance(output, int) and isinstance(thoughts, int):
+        output += thoughts
+    return usage_of(1, prompt, output, total)
+
+
 def decode_image(value: str) -> bytes:
     value = str(value)
     if "-" in value or "_" in value:  # URL 安全的 base64
@@ -584,21 +604,22 @@ class GeminiBackend(Backend):
             raise
 
     async def _call(self, clients: Clients, api: str, prompt: str, ratio: str, tier: str, seed: int | None,
-                    extra: dict, images: list[tuple[str, str]] | tuple = ()) -> tuple[bytes, str]:
+                    extra: dict, images: list[tuple[str, str]] | tuple = ()) -> tuple[bytes, str, dict]:
         url, body = self.build_request(api, prompt, ratio, tier, seed, images)
         data = await self._request(clients, "POST", url, timeout=self.timeout, json=merge_extra(body, extra))
+        usage = gemini_usage(data)
         if api != "interactions":
             b64, text = parse_generate_content(data, edit=bool(images))
-            return decode_image(b64), text
+            return decode_image(b64), text, usage
         block, text = parse_interaction(data)
         if block.get("data"):
-            return decode_image(block["data"]), text
+            return decode_image(block["data"]), text, usage
         # 只有请求 delivery=uri 时才会返回链接（本插件不请求）；API Key 只发给 API 地址本身（协议、主机、端口都相同）
         uri = as_str(block.get("uri"))
         same_origin = urlparse(uri)[:2] == urlparse(self.base_url)[:2]
         image = await download_image(clients.http, uri, label=self.label, proxy=self.proxy, timeout=self.timeout,
                                      headers=self.headers if same_origin else None)
-        return image, text
+        return image, text, usage
 
     async def generate(self, clients: Clients, req: DrawRequest) -> DrawResult:
         if self.missing():
@@ -620,7 +641,7 @@ class GeminiBackend(Backend):
         extra = self.extra_body()  # 先解析，JSON 有误时不发请求
         api = "interactions" if self.api == "interactions" else "generate_content"
         try:
-            image, text = await self._call(clients, api, prompt, ratio, tier, seed, extra, images)
+            image, text, usage = await self._call(clients, api, prompt, ratio, tier, seed, extra, images)
         except DrawError as e:
             # 自动模式：generateContent 不提供该模型（404，不计费）时改用 Interactions API 再试一次。
             # 额外请求参数按 generateContent 的格式填写，回退时不附加。
@@ -628,7 +649,7 @@ class GeminiBackend(Backend):
                 raise
             api = "interactions"
             try:
-                image, text = await self._call(clients, api, prompt, ratio, tier, seed, {}, images)
+                image, text, usage = await self._call(clients, api, prompt, ratio, tier, seed, {}, images)
             except DrawError as e2:
                 if e2.status == 404:  # 两个接口都找不到，多半是模型名或 API 地址有误，报告第一个错误
                     raise e from e2
@@ -645,6 +666,7 @@ class GeminiBackend(Backend):
             params["thinking_level"] = self.thinking_level
         if seed is not None:
             params["seed"] = seed
+        params["usage"] = usage
         return image_result(image, params, text)
 
     async def list_models(self, clients: Clients) -> list[str]:

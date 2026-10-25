@@ -42,6 +42,7 @@ from .base import (
     parse_extra_json,
     response_detail,
     send,
+    usage_of,
     with_retries,
 )
 
@@ -490,9 +491,8 @@ class XAIBackend(Backend):
         params = self.params_of(body)
         usage = data.get("usage")
         ticks = as_float(usage.get("cost_in_usd_ticks"), -1) if isinstance(usage, dict) else -1
-        if ticks >= 0:
-            # 1 美元 = 100 亿 ticks；修改图片按输入图片和输出图片一起计费
-            params["cost_usd"] = round(ticks / 1e10, 4)
+        # 1 美元 = 100 亿 ticks；修改图片按输入图片和输出图片一起计费
+        params["usage"] = usage_of(len(items), cost=ticks / 1e10 if ticks >= 0 else None, currency="USD")
         # revised_prompt 已不再返回，兼容旧接口和中转服务
         return image_result(image, params, as_str(item.get("revised_prompt")))
 

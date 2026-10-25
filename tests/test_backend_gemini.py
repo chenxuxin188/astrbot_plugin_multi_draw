@@ -161,7 +161,8 @@ def test_default_request_per_orientation(orientation, ratio):
         "generationConfig": {"responseModalities": ["TEXT", "IMAGE"], "imageConfig": {"aspectRatio": ratio}},
     }
     assert result.image == PNG and result.mime == "image/png"
-    assert result.params == {"model": DEFAULT_MODEL, "size": ratio, "aspect_ratio": ratio, "api": "generateContent"}
+    assert result.params == {"model": DEFAULT_MODEL, "size": ratio, "aspect_ratio": ratio, "api": "generateContent",
+                             "usage": {"images": 1}}
 
 
 @pytest.mark.parametrize(
@@ -783,7 +784,9 @@ def test_schema_section_shape():
     assert sec["type"] == "object" and sec["description"].endswith("设置")
     items = sec["items"]
     assert list(items) == ["api_key", "base_url", "proxy_url", "model", "portrait_size", "landscape_size",
-                           "square_size", "image_size", "thinking_level", "api", "timeout", "extra_body"]
+                           "square_size", "image_size", "thinking_level", "api", "timeout", "extra_body",
+                           "track_usage", "price_per_image", "price_input_per_million",
+                           "price_output_per_million", "price_currency"]
     for name, field in items.items():
         assert field["type"] in ALLOWED_TYPES, name
         assert field["description"] and field["hint"], name
@@ -906,7 +909,7 @@ def test_edit_generate_content_request_shape():
     }
     assert result.image == JPEG and result.mime == "image/jpeg" and result.text == "Here it is"
     assert result.params == {"model": DEFAULT_MODEL, "size": "3:4", "aspect_ratio": "3:4", "api": "generateContent",
-                             "mode": "edit", "input_images": 2, "seed": 9}
+                             "mode": "edit", "input_images": 2, "seed": 9, "usage": {"images": 1}}
 
 
 @pytest.mark.parametrize(
@@ -1026,7 +1029,8 @@ def test_edit_interactions_request_shape():
     }
     assert result.image == PNG and result.text == "done"
     assert result.params == {"model": DEFAULT_MODEL, "size": "1:1 2K", "aspect_ratio": "1:1", "api": "Interactions",
-                             "mode": "edit", "input_images": 2, "image_size": "2K", "thinking_level": "high"}
+                             "mode": "edit", "input_images": 2, "image_size": "2K", "thinking_level": "high",
+                             "usage": {"images": 1}}
 
 
 def test_edit_auto_fallback_resends_images():
@@ -1269,3 +1273,18 @@ def test_schema_defaults_produce_valid_edit_request(api):
     else:
         assert_valid_gc_body(rec.body(), DEFAULT_MODEL)
         assert rec.body()["generationConfig"]["imageConfig"] == {"aspectRatio": "4:3"}
+
+
+def test_usage_from_both_apis():
+    gemini = gemini_mod
+    meta = {"usageMetadata": {"promptTokenCount": 300, "candidatesTokenCount": 1290, "thoughtsTokenCount": 200,
+                              "totalTokenCount": 1790}}
+    # 思考 token 按输出计费，计入输出
+    assert gemini.gemini_usage(meta) == {"images": 1, "input_tokens": 300, "output_tokens": 1490,
+                                         "total_tokens": 1790}
+    interactions = {"usage": {"total_input_tokens": 20, "total_output_tokens": 1120, "total_tokens": 1140}}
+    assert gemini.gemini_usage(interactions) == {"images": 1, "input_tokens": 20, "output_tokens": 1120,
+                                                 "total_tokens": 1140}
+    assert gemini.gemini_usage({}) == {"images": 1}
+    assert gemini.gemini_usage({"usageMetadata": {"promptTokenCount": "x"}}) == {"images": 1}
+

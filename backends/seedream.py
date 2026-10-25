@@ -41,6 +41,7 @@ from .base import (
     parse_extra_json,
     response_detail,
     send,
+    usage_of,
     with_retries,
 )
 
@@ -707,6 +708,10 @@ class SeedreamBackend(Backend):
         request_id = resp.headers.get("x-request-id")
         if request_id:
             params["request_id"] = request_id
+        # 按成功生成的图片张数计费
+        usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+        params["usage"] = usage_of(usage.get("generated_images") or 1, usage.get("input_tokens"),
+                                   usage.get("output_tokens"), usage.get("total_tokens"))
         return image_result(image, params)
 
     # ------------------------------------------------------------ 余额查询

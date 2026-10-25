@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import audit  # noqa: E402
 import gallery  # noqa: E402
 import prompting  # noqa: E402
+import usage  # noqa: E402
 from backends import novelai as nai_client  # noqa: E402
 from backends.base import DrawError, DrawRequest  # noqa: E402
 from backends.novelai import ImageRequest, NovelAIBackend, NovelAIClient, NovelAIError  # noqa: E402
@@ -753,3 +754,140 @@ def test_size_parsers_accept_trailing_period_and_reject_overflow():
     assert pick_size("16:9.", "landscape", "5.0-pro") == pick_size("16:9", "landscape", "5.0-pro")
     assert pick_size("2048 x 2048。", "square", "5.0-pro") == "2048x2048"
     assert parse_aspect("1" * 160 + "x" + "1" * 160, RATIOS, "2:3") == ("2:3", 0)
+
+
+# ---------------------------------------------------------------- 消耗统计
+
+
+def test_estimate_cost_prefers_platform_cost_then_tokens_then_per_image():
+    section = {"price_per_image": 0.05, "price_input_per_million": 2, "price_output_per_million": 30,
+               "price_currency": "USD"}
+    assert usage.estimate_cost({"images": 1, "cost": 0.07, "currency": "USD"}, section) == (0.07, "USD", False)
+    assert usage.estimate_cost({"images": 1, "input_tokens": 500, "output_tokens": 1290}, section) == \
+        (0.0397, "USD", True)
+    assert usage.estimate_cost({"images": 2, "total_tokens": 5000}, section) == (0.1, "USD", True)
+    # 只填了一个 token 价格时按张估算
+    only_input = dict(section, price_output_per_million=0)
+    assert usage.estimate_cost({"images": 1, "input_tokens": 500, "output_tokens": 1290}, only_input) == \
+        (0.05, "USD", True)
+    nan_cost = {"images": 1, "cost": float("nan"), "currency": "USD"}
+    assert usage.estimate_cost(nan_cost, section)[2] is True
+    assert usage.estimate_cost({"images": 1}, {}) == (None, "", False)
+    assert usage.estimate_cost({"images": 1}, {"price_per_image": "abc"}) == (None, "", False)
+    assert usage.estimate_cost({"images": 1}, {"price_per_image": -1}) == (None, "", False)
+
+
+def test_apply_usage_respects_switch():
+    record = {"usage": {"images": 1, "cost": 0.04, "currency": "USD"}}
+    usage.apply_usage(record, {"track_usage": True})
+    assert record["cost"] == 0.04 and "cost_estimated" not in record
+    record = {"usage": {"images": 1}}
+    usage.apply_usage(record, {"track_usage": False, "price_per_image": 1})
+    assert record == {}
+    record = {"usage": {"images": 1}}
+    usage.apply_usage(record, {})
+    assert record == {"usage": {"images": 1}}  # 没有配置价格时只记录用量
+
+
+def test_format_cost():
+    assert usage.format_cost(0.16690, "USD", True) == "约 0.1669 USD"
+    assert usage.format_cost(2.0, "元") == "2 元"
+    assert usage.format_cost(0.00001, "USD") == "<0.0001 USD"
+    assert usage.format_cost(0, "USD") == "0 USD"
+
+
+def _rec(time, backend="openai", status="success", user="1", **extra):
+    return {"time": time, "backend": backend, "backend_label": backend.title(), "status": status, "user_id": user,
+            **extra}
+
+
+def test_summarize_filters_and_totals():
+    from datetime import datetime, timezone
+
+    now = datetime(2026, 10, 25, 15, 0, tzinfo=timezone.utc)
+    records = [
+        _rec("2026-10-20T10:00:00+00:00", usage={"images": 1, "total_tokens": 100}),
+        _rec("2026-10-25T09:00:00+00:00", usage={"images": 1, "input_tokens": 10, "output_tokens": 90,
+                                                   "total_tokens": 100}, cost=0.5, currency="USD",
+             cost_estimated=True),
+        _rec("2026-10-25T10:00:00+00:00", backend="novelai", anlas_cost=20, user="2"),
+        _rec("2026-10-25T11:00:00+00:00", backend="novelai", anlas_cost=-500, user="2"),  # 期间充值
+        _rec("2026-10-25T12:00:00+00:00", backend="xai", status="failed"),
+        _rec("2026-10-25T13:00:00+00:00", backend="xai", usage={"images": 1, "cost": 0.02, "currency": "USD"},
+             cost=0.02, currency="USD"),
+        _rec("broken time"),
+    ]
+    today = usage.period_start(1, now)
+    assert today == datetime(2026, 10, 25, tzinfo=timezone.utc)
+    assert usage.period_start(7, now) == datetime(2026, 10, 19, tzinfo=timezone.utc)
+    assert usage.period_start(0, now) is None
+
+    s = usage.summarize(records, today, order=["novelai", "openai", "xai"])
+    assert [r["backend"] for r in s["backends"]] == ["novelai", "openai", "xai"] and s["count"] == 5
+    nai, oai, xai = s["backends"]
+    assert nai["images"] == 2 and nai["anlas"] == 20 and nai["anlas_records"] == 2
+    assert oai["images"] == 1 and oai["total_tokens"] == 100 and oai["costs"] == {"USD": 0.5}
+    assert xai["success"] == 1 and xai["failed"] == 1 and xai["costs"] == {"USD": 0.02} and xai["estimated"] == []
+    total = s["total"]
+    assert total["costs"] == {"USD": 0.52} and total["estimated"] == ["USD"] and total["images"] == 4
+    assert not s["truncated"]
+
+    assert usage.summarize(records, None)["count"] == 7  # 不限时间时时间格式错误的记录也计入
+    assert usage.summarize(records, today, user_id="2")["count"] == 2
+    assert usage.summarize(records, today, backend="xai")["count"] == 2
+    # 删除过的旧记录在统计范围内时说明统计不完整
+    yesterday = datetime(2026, 10, 24, 23, 0, tzinfo=timezone.utc)
+    assert usage.summarize(records, today, trimmed_until=yesterday)["truncated"] is False
+    assert usage.summarize(records, None, trimmed_until=yesterday)["truncated"] is True
+    assert usage.summarize(records, today, trimmed_until=today)["truncated"] is True
+    assert usage.summarize(records, today)["truncated"] is False
+
+    text = usage.format_summary(s, 1)
+    assert text.startswith("绘图消耗（今天），共 5 次绘图：")
+    assert "【Novelai】成功 2 张；消耗 20 Anlas" in text
+    assert "【Openai】成功 1 张；100 tokens（输入 10 / 输出 90）；约 0.5 USD" in text
+    assert "【Xai】成功 1 张，失败 1 次；0.02 USD" in text
+    assert "合计：成功 4 张，失败 1 次；消耗 20 Anlas；100 tokens（输入 10 / 输出 90）；约 0.52 USD" in text
+    assert "按配置的价格估算" in text
+    empty = usage.summarize([], today)
+    assert usage.format_summary(empty, 7, "你的") == "你的绘图消耗（最近 7 天）：没有绘图记录。"
+
+
+def test_summarize_survives_malformed_records():
+    bad = [
+        {"time": "0001-01-01T00:00:00", "backend": "openai", "status": "success"},
+        {"time": "2026-10-25T10:00:00+00:00", "backend": "openai", "status": "success",
+         "usage": {"images": float("nan"), "total_tokens": float("inf")}, "cost": float("nan"), "currency": "USD"},
+        {"time": "2026-10-25T10:00:00+00:00", "backend": "novelai", "status": "success", "anlas_cost": float("inf")},
+    ]
+    s = usage.summarize(bad, None)
+    assert s["count"] == 3 and s["total"]["costs"] == {} and s["total"]["anlas_records"] == 0
+    assert s["total"]["images"] == 3 and s["total"]["total_tokens"] == 0
+    assert usage.format_record_usage(bad[1]) == ""
+    assert usage.summarize(bad, usage.period_start(1))["count"] <= 2
+
+
+def test_audit_remembers_trimmed_records(tmp_path):
+    log = audit.AuditLog(tmp_path / "audit.jsonl", max_records=10)
+    assert asyncio.run(log.trimmed_until()) is None
+
+    async def fill():
+        for i in range(25):
+            await log.append({"time": f"2026-10-{i + 1:02d}T08:00:00+08:00", "status": "success"})
+
+    asyncio.run(fill())
+    records = asyncio.run(log.records())
+    assert len(records) < 25 and records[-1]["time"].startswith("2026-10-25")
+    until = asyncio.run(log.trimmed_until())
+    first_kept = usage.record_time(records[0])
+    assert until is not None and until < first_kept and (log.path.parent / "audit.meta.json").is_file()
+
+
+def test_audit_records_and_format_usage(tmp_path):
+    log = audit.AuditLog(tmp_path / "audit.jsonl")
+    asyncio.run(log.append({"status": "success", "backend": "xai", "model": "grok-imagine-image",
+                            "usage": {"images": 2, "cost": 0.14, "currency": "USD"}, "cost": 0.14, "currency": "USD"}))
+    records = asyncio.run(log.records())
+    assert len(records) == 1 and records[0]["_no"] == 1
+    assert "2 张 · 0.14 USD" in audit.format_record(records[0])
+

@@ -4,12 +4,20 @@ import asyncio
 import json
 import math
 import os
+from datetime import datetime
 from pathlib import Path
+
+try:
+    from .usage import format_record_usage
+except ImportError:  # 单独测试时作为顶层模块导入
+    from usage import format_record_usage
 
 
 class AuditLog:
     def __init__(self, path: Path, max_records: int = 2000):
         self.path = Path(path)
+        # 超过条数上限删除旧记录时，记下删除的记录中最新一条的时间，统计消耗时据此说明统计不完整
+        self.meta_path = self.path.with_name(self.path.stem + ".meta.json")
         self.max_records = max_records
         self._count: int | None = None
         self._lock = asyncio.Lock()
@@ -27,8 +35,8 @@ class AuditLog:
         async with self._lock:
             await asyncio.to_thread(self._append_sync, record)
 
-    async def page(self, page: int, page_size: int) -> tuple[list[dict], int, int, int]:
-        """按从新到旧分页，返回 (本页记录, 实际页码, 总页数, 总条数)。每条记录带有序号 _no。"""
+    async def records(self) -> list[dict]:
+        """全部记录，从旧到新。每条记录带有序号 _no。"""
         async with self._lock:
             lines = await asyncio.to_thread(self._read_lines)
         records = []
@@ -40,6 +48,20 @@ class AuditLog:
             if isinstance(record, dict):
                 record["_no"] = no
                 records.append(record)
+        return records
+
+    async def trimmed_until(self) -> datetime | None:
+        """已删除的旧记录中最新一条的时间；没有删除过记录时返回 None。"""
+        try:
+            text = await asyncio.to_thread(self.meta_path.read_text, encoding="utf-8")
+            when = datetime.fromisoformat(str(json.loads(text).get("trimmed_until")))
+            return when if when.tzinfo else when.astimezone()
+        except (OSError, ValueError, OverflowError, AttributeError):
+            return None
+
+    async def page(self, page: int, page_size: int) -> tuple[list[dict], int, int, int]:
+        """按从新到旧分页，返回 (本页记录, 实际页码, 总页数, 总条数)。每条记录带有序号 _no。"""
+        records = await self.records()
         page_size = max(1, page_size)
         total = len(records)
         pages = max(1, math.ceil(total / page_size))
@@ -65,12 +87,27 @@ class AuditLog:
         limit = max(1, int(self.max_records))
         # 留一点余量，避免每写一条都重写整个文件
         if self._count > limit + max(10, limit // 10):
-            lines = self._read_lines()[-limit:]
+            lines = self._read_lines()
+            self._remember_trim(lines[:-limit])
+            lines = lines[-limit:]
             tmp = self.path.with_name(self.path.name + ".tmp")
             with tmp.open("w", encoding="utf-8") as f:
                 f.write("\n".join(lines) + "\n")
             os.replace(tmp, self.path)
             self._count = len(lines)
+
+
+    def _remember_trim(self, dropped: list[str]) -> None:
+        for line in reversed(dropped):
+            try:
+                when = json.loads(line).get("time")
+                datetime.fromisoformat(str(when))
+            except (ValueError, AttributeError, OverflowError):
+                continue
+            tmp = self.meta_path.with_name(self.meta_path.name + ".tmp")
+            tmp.write_text(json.dumps({"trimmed_until": when}), encoding="utf-8")
+            os.replace(tmp, self.meta_path)
+            return
 
 
 def _clip(text: object, limit: int) -> str:
@@ -103,6 +140,9 @@ def format_record(record: dict) -> str:
             params += f" | 消耗 {record['anlas_cost']} Anlas"
         elif record.get("opus_free") is not None:
             params += " | 预计免费" if record["opus_free"] else " | 可能消耗 Anlas"
+        usage = format_record_usage(record)
+        if usage:
+            params += f" | {usage}"
         lines.append("  " + params)
     if not ok:
         stage = _STAGE_NAMES.get(record.get("stage", ""), record.get("stage", ""))

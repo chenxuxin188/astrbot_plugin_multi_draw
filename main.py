@@ -82,6 +82,7 @@ from .prompting import (
     parse_tag_output,
     strip_think,
 )
+from .usage import apply_usage, format_summary, period_start, summarize
 from .webapi import WebApi
 
 PLUGIN_NAME = "astrbot_plugin_multi_draw"
@@ -103,6 +104,10 @@ USER_IMAGE_TTL = 30 * 60
 USER_IMAGE_ENTRIES = 500
 # 这些平台在流水线结束后会关闭回复通道，后台任务发出的消息会被丢弃，需要等绘图完成
 INLINE_PLATFORMS = ("webchat", "wecom_ai_bot")
+# /draw usage 和 draw_usage 默认统计的天数
+DEFAULT_USAGE_DAYS = 30
+USAGE_ALL_WORDS = ("all", "全部", "所有")
+USAGE_TODAY_WORDS = ("today", "今天", "今日")
 # 等不到绘图完成时给事件打上的标记（值为当时的 monotonic 时间）：之后的消息改为通过 context.send_message 主动发送
 DETACHED_KEY = "multi_draw_detached"
 # 提前结束本轮后，至少等这么久再主动发送：WebUI 对话关闭本轮的回复通道需要一点时间，太早发送的消息会丢失
@@ -133,7 +138,7 @@ def _persona_text(persona) -> str:
 
 
 class MultiDrawPlugin(Star):
-    """多平台绘图：直接让 Bot 画画；管理员可用 /draw use、/draw account、/draw audit [页码]"""
+    """多平台绘图：直接让 Bot 画画；/draw usage 查看消耗；管理员可用 /draw use、/draw balance、/draw audit [页码]"""
 
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -308,6 +313,43 @@ class MultiDrawPlugin(Star):
                 event.set_extra(DETACHED_KEY, time.monotonic())
         return None
 
+    @filter.llm_tool(name="draw_usage")
+    async def draw_usage_tool(self, event: AstrMessageEvent, days: int = DEFAULT_USAGE_DAYS, platform: str = "",
+                              **kwargs):
+        """查询画图的消耗统计：画了多少张、用了多少 token 或 Anlas、大约花了多少钱；管理员还会看到各绘图平台的余额。当用户问画图花了多少钱、消耗了多少、今天画了几张、还剩多少余额或额度时调用。查到的结果请用你的口吻转述给用户。
+
+        Args:
+            days(number): 统计最近几天：1 表示今天，7 表示最近 7 天，0 表示全部记录；用户没说时填 30
+            platform(string): 可选，只统计某个绘图平台，例如 novelai、openai、gemini；不确定就留空，统计全部平台
+        """
+        days = as_int(days, DEFAULT_USAGE_DAYS, 0, 3650)
+        key = None
+        if as_str(platform):
+            key = resolve_key(as_str(platform))
+            if not key:
+                return f"没有名为「{platform}」的绘图平台，可选：{'、'.join(BACKEND_ORDER)}"
+        admin = self._is_admin(event)
+        text = await self.usage_text(days, None if admin else str(event.get_sender_id()), key)
+        if not admin:
+            return text + "\n（只统计了该用户自己的绘图；各平台的余额只有管理员可以查询）"
+        keys = [key] if key else [k for k in BACKEND_ORDER if not backend_missing(self.backend(k))]
+        keys = [k for k in keys if not backend_balance_missing(self.backend(k))]
+        if keys:
+            results = await asyncio.gather(*(self.query_balance(self.backend(k)) for k in keys))
+            text += "\n各平台余额：\n" + "\n".join(
+                f"【{BACKENDS[k].label}】{r}" for k, r in zip(keys, results, strict=True))
+        return text
+
+    async def usage_text(self, days: int, user_id: str | None = None, backend: str | None = None) -> str:
+        """最近 days 天（0 为全部）的绘图消耗统计文字。user_id 不为空时只统计该用户。"""
+        records = await self.audit.records()
+        summary = summarize(records, period_start(days), user_id, backend, BACKEND_ORDER,
+                            await self.audit.trimmed_until())
+        whose = "你的" if user_id is not None else ""
+        if backend:
+            whose += f"{BACKENDS[backend].label} "
+        return format_summary(summary, days, whose)
+
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def remember_user_images(self, event: AstrMessageEvent):
         """记下用户最近发送的图片地址（不下载），用户之后单独发文字要求修改时使用。"""
@@ -421,6 +463,30 @@ class MultiDrawPlugin(Star):
             return f"查询失败：{_err_text(e)}"
         text = "；".join(f"{k}：{v}" for k, v in info.items) or "没有返回余额信息"
         return f"{text}（{info.note}）" if info.note else text
+
+    @draw.command("usage")
+    async def draw_usage(self, event: AstrMessageEvent, first: str = "", second: str = ""):
+        """查看绘图消耗：/draw usage [天数|today|all] [平台]，默认最近 30 天；管理员看到所有人的，其他人只看到自己的"""
+        days, key = DEFAULT_USAGE_DAYS, None
+        for word in (as_str(first), as_str(second)):
+            if not word:
+                continue
+            lower = word.lower()
+            if lower in USAGE_ALL_WORDS:
+                days = 0
+            elif lower in USAGE_TODAY_WORDS:
+                days = 1
+            elif re.fullmatch(r"\d{1,4}", lower):
+                days = int(lower)
+            elif resolve_key(word):
+                key = resolve_key(word)
+            else:
+                yield event.plain_result(
+                    f"无法识别「{word}」。用法：/draw usage [天数|today|all] [平台]，例如 /draw usage 7 openai"
+                )
+                return
+        uid = None if self._is_admin(event) else str(event.get_sender_id())
+        yield event.plain_result(await self.usage_text(days, uid, key)).use_t2i(False)
 
     @draw.command("audit")
     async def draw_audit(self, event: AstrMessageEvent, page: int = 1):
@@ -671,8 +737,9 @@ class MultiDrawPlugin(Star):
         """按平台排队生成图片，返回 (发送图片的任务, 生成结果)。
 
         使用 NovelAI 且开启 Anlas 记录时，在占用生成名额期间查询前后余额，差值只属于本次请求。
+        其他平台按各自的「记录用量」设置记录平台返回的用量，并按配置的价格估算费用。
         """
-        track = isinstance(backend, NovelAIBackend) and as_bool(self.section("audit").get("track_anlas"), True)
+        track = isinstance(backend, NovelAIBackend) and as_bool(self.section("novelai").get("track_anlas"), True)
         # 先记下预计使用的参数，生成失败时记录中也有模型和尺寸
         with contextlib.suppress(Exception):
             record.update(backend.plan(req))
@@ -685,6 +752,7 @@ class MultiDrawPlugin(Star):
                     await self._record_anlas(backend, record, before)
                 raise
             record.update(result.params)
+            apply_usage(record, backend.section)
             if result.text:
                 logger.info(f"{LOG_PREFIX} {backend.label} 返回的文字：{result.text[:500]}")
             # 先把图片发出去，等待扣费结算、保存图片与上传同时进行

@@ -126,7 +126,8 @@ def test_default_request_per_orientation(orientation, ratio):
                           "aspect_ratio": ratio, "resolution": "1k", "quality": "medium"}
     assert result.image == JPEG and result.mime == "image/jpeg"
     assert result.params == {"model": "grok-imagine-image-2.0", "size": f"{ratio} 1k", "aspect_ratio": ratio,
-                             "resolution": "1k", "quality": "medium", "cost_usd": 0.04}
+                             "resolution": "1k", "quality": "medium",
+                             "usage": {"images": 1, "cost": 0.04, "currency": "USD"}}
 
 
 def test_negative_prompt_folded_and_no_unsupported_fields():
@@ -392,7 +393,7 @@ def test_b64_with_data_uri_prefix_and_png():
     data = {"data": [{"b64_json": "data:image/png;base64," + base64.b64encode(PNG).decode()}]}
     result = run(backend(), Recorder(httpx.Response(200, json=data)))
     assert result.image == PNG and result.mime == "image/png"
-    assert "cost_usd" not in result.params and result.text == ""
+    assert result.params["usage"] == {"images": 1} and result.text == ""
 
 
 def test_revised_prompt_kept_as_text():
@@ -649,7 +650,8 @@ def test_schema_section_shape_and_defaults_match_code():
     items = section["items"]
     assert section["type"] == "object" and section["description"].endswith("设置")
     assert list(items) == ["api_key", "base_url", "proxy_url", "model", "portrait_size", "landscape_size",
-                           "square_size", "resolution", "quality", "timeout", "extra_body", "management_key", "team_id"]
+                           "square_size", "resolution", "quality", "timeout", "extra_body", "management_key", "team_id",
+                           "track_usage", "price_per_image", "price_currency"]
     for name, field in items.items():
         assert field["type"] in ("string", "text", "int", "float", "bool", "list"), name
         assert field.get("description") and field.get("hint"), name
@@ -740,7 +742,8 @@ def test_edit_single_image_request_shape():
                           "image": {"url": data_url(JPEG, "image/jpeg")}}
     assert result.image == JPEG and result.mime == "image/jpeg"
     assert result.params == {"model": "grok-imagine-image-2.0", "size": "原图比例 1k", "aspect_ratio": "input",
-                             "resolution": "1k", "quality": "medium", "cost_usd": 0.04, "mode": "edit",
+                             "resolution": "1k", "quality": "medium", "mode": "edit",
+                             "usage": {"images": 1, "cost": 0.04, "currency": "USD"},
                              "input_images": 1}
 
 

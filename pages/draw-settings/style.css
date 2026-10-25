@@ -1216,6 +1216,32 @@ body.has-footer .toasts {
 
 /* ------------------------------------------------------------ 记录 */
 
+.usage-card .card-head {
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.usage-table th.num,
+.usage-table td.num {
+  text-align: right;
+  white-space: nowrap;
+  padding-left: 12px;
+}
+
+.usage-table tbody th {
+  padding-right: 12px;
+}
+
+.usage-table tr.usage-total th,
+.usage-table tr.usage-total td {
+  font-weight: 600;
+  border-top: 2px solid var(--border);
+}
+
+.usage-note {
+  margin: 10px 0 0;
+}
+
 .toolbar {
   display: flex;
   align-items: center;

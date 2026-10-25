@@ -100,7 +100,7 @@ def test_default_request():
     }
     assert result.image == PNG and result.mime == "image/png" and result.text == ""
     assert result.params == {"model": "gpt-image-2.5-flare", "size": "1024x1536", "quality": "medium",
-                             "output_format": "png", "tokens": 1234}
+                             "output_format": "png", "usage": {"images": 1, "total_tokens": 1234}}
 
 
 @pytest.mark.parametrize(("orientation", "size"), [
@@ -579,7 +579,9 @@ def test_schema_section_shape_and_defaults_match_code():
     assert section["type"] == "object" and section["description"]
     assert list(items) == ["api_key", "base_url", "proxy_url", "model", "portrait_size", "landscape_size",
                            "square_size", "quality", "output_format", "background", "moderation", "response_format",
-                           "edit_model", "edit_size", "timeout", "extra_body", "balance_mode", "balance_key"]
+                           "edit_model", "edit_size", "timeout", "extra_body", "balance_mode", "balance_key",
+                           "track_usage", "price_per_image", "price_input_per_million",
+                           "price_output_per_million", "price_currency"]
     for name, field in items.items():
         assert field["type"] in ("string", "text", "int", "float", "bool", "list"), name
         assert field["description"] and field["hint"], name
@@ -691,7 +693,8 @@ def test_edit_request_single_image():
     assert files == [("image", "image_1.jpg", "image/jpeg", JPEG)]
     assert result.image == PNG and result.mime == "image/png"
     assert result.params == {"mode": "edit", "model": "gpt-image-2.5-flare", "size": "1024x1536",
-                             "input_images": 1, "quality": "medium", "output_format": "png", "tokens": 900}
+                             "input_images": 1, "quality": "medium", "output_format": "png",
+                             "usage": {"images": 1, "total_tokens": 900}}
 
 
 def test_edit_request_multiple_images_keep_order_and_detect_type():
