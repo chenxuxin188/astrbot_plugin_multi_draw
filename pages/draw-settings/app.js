@@ -27,11 +27,11 @@ const BALANCE_CONCURRENCY = 2;
 
 const TABS = [
   { key: "backends", label: "绘图平台" },
-  { key: "prompts", label: "提示词与人格" },
+  { key: "prompts", label: "通用与人格" },
   { key: "records", label: "记录" },
   { key: "gallery", label: "图库" },
 ];
-const PROMPT_SECTIONS = ["draw", "prompt", "persona"];
+const PROMPT_SECTIONS = ["draw", "quota", "prompt", "persona"];
 const RECORD_SECTIONS = ["audit"];
 const ORIENTATIONS = [
   ["portrait", "竖图"],
@@ -1744,7 +1744,7 @@ function testCard(b) {
       range.focus();
     });
     const df = sectionItems("draw").edit_strength;
-    const where = df ? "默认值来自「提示词与人格」中的「" + sectionTitle("draw") + " · " + (df.description || "edit_strength") + "」。" : "";
+    const where = df ? "默认值来自「通用与人格」中的「" + sectionTitle("draw") + " · " + (df.description || "edit_strength") + "」。" : "";
     strengthRow = h(
       "div",
       { class: "strength-row" },
@@ -2271,7 +2271,7 @@ function runTest(key) {
     });
 }
 
-// ------------------------------------------------------------------ 提示词与人格
+// ------------------------------------------------------------------ 通用与人格
 
 function renderPromptsPanel(panel) {
   const names = PROMPT_SECTIONS.filter((k) => isSection(S.schema[k])).concat(

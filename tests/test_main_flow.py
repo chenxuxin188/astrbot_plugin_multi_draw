@@ -920,3 +920,189 @@ def test_anlas_tracking_setting_in_novelai_section(env, monkeypatch):
 
     run(plugin.terminate())
 
+
+# ---------------------------------------------------------------- 使用范围与每日次数
+
+
+def quota_responder(kwargs):
+    prompt = kwargs.get("prompt") or ""
+    if "备用画笔" in prompt:
+        return "今天的次数用完啦，换支备用画笔画！"
+    if "明天再来" in prompt:
+        return "今天画不动啦，明天再来找我吧～"
+    return llm_responder(kwargs)
+
+
+def user_event(sender="20002", group="30003"):
+    return astrbot_stub.AstrMessageEvent(sender=sender, group=group)
+
+
+def test_whitelist_and_blacklist_block_tools(env):
+    main, config, tmp = env
+    plugin, ctx = make_plugin(main, config, nai_ok)
+    event = user_event(group="555")
+    config["quota"]["blacklist"] = ["555"]
+    assert run(plugin.draw_image_tool(event, description="猫")) == main.BLOCKED_TOOL_RESULT
+    assert run(plugin.edit_image_tool(event, instruction="改成夜景")) == main.BLOCKED_TOOL_RESULT
+    status = run(collect_results(plugin.draw_status(event)))[0][0].text
+    assert "本会话：不能画画（在黑名单中）" in status
+    # 白名单不为空时只看白名单，黑名单不生效
+    config["quota"]["whitelist"] = ["aiocqhttp:GroupMessage:555"]
+    assert not plugin._session_blocked(event)
+    assert plugin._session_blocked(user_event(group="666")) == "whitelist"
+    assert event.sent == [] and not plugin._tasks
+    run(plugin.terminate())
+
+
+def test_daily_limit_without_fallback_reminds_by_persona(env):
+    main, config, tmp = env
+    config["quota"]["session_daily_limit"] = 2
+    config["quota"]["user_daily_limit"] = 0
+    plugin, ctx = make_plugin(main, config, nai_ok, quota_responder)
+    a, b = user_event("20002"), user_event("20003")
+
+    async def go():
+        await plugin._draw_flow(a, "画一只猫", "", "llm")
+        await plugin._draw_flow(b, "画一只狗", "", "llm")
+        await plugin._draw_flow(a, "再画一只猫", "", "llm")
+        return (await plugin.audit.page(1, 10))[0]
+
+    records = run(go())
+    assert len(records) == 2  # 第三次没有画，也不写记录
+    assert texts(a)[-1] == "今天画不动啦，明天再来找我吧～" and "<image>" not in texts(a)[3:]
+    limit_call = [c for c in ctx.calls if "明天再来" in (c.get("prompt") or "")][0]
+    assert "这个群今天的 2 次画画次数已经用完了" in limit_call["prompt"] and "再画一只猫" in limit_call["prompt"]
+    # 其他群不受影响；管理员不受限制，也不计数
+    other = user_event("20002", group="40004")
+    assert plugin._limit_check(other) == ("", False) and plugin._limit_check(user_event("10001")) == ("", False)
+    status = run(collect_results(plugin.draw_status(a)))[0][0].text
+    assert "今日绘图次数：本群 2/2" in status and "你 " not in status.split("今日绘图次数")[1]
+
+    # 次数保存在文件中，重载插件后仍然有效
+    saved = json.loads((tmp / "astrbot_plugin_multi_draw" / "quota.json").read_text(encoding="utf-8"))
+    assert saved["session"] == {"aiocqhttp:group:30003": 2}
+    assert saved["user"] == {"aiocqhttp:20002": 1, "aiocqhttp:20003": 1}
+    run(plugin.terminate())
+    plugin2, _ = make_plugin(main, config, nai_ok)
+    assert plugin2.quota.used("session", "aiocqhttp:group:30003") == 2
+    run(plugin2.terminate())
+
+
+def test_daily_limit_with_fallback_backend(env):
+    main, config, tmp = env
+    config["draw"]["backend"] = "openai"
+    config["openai"]["api_key"] = "sk-test-abcdefgh"
+    config["quota"].update(session_daily_limit=0, user_daily_limit=1, fallback_backend="novelai")
+    hosts = []
+
+    def handler(request):
+        hosts.append(request.url.host)
+        if request.url.host == "api.openai.com":
+            return httpx.Response(200, json={"data": [{"b64_json": base64.b64encode(PNG).decode()}]})
+        return httpx.Response(200, content=make_zip())
+
+    plugin, ctx = make_plugin(main, config, handler, quota_responder)
+    event = user_event()
+
+    async def go():
+        await plugin._draw_flow(event, "画一只猫", "", "llm")
+        await plugin._draw_flow(event, "再画一只猫", "", "llm")
+        await plugin._draw_flow(event, "第三只猫", "", "llm")
+        return (await plugin.audit.page(1, 10))[0]
+
+    third, second, first = run(go())
+    assert first["backend"] == "openai" and "fallback" not in first
+    assert second["backend"] == third["backend"] == "novelai" and second["fallback"] is True
+    assert second["limit_reason"] == "对方今天的 1 次画画次数已经用完了"
+    assert texts(event).count("<image>") == 3 and "今天的次数用完啦，换支备用画笔画！" in texts(event)
+    # 备用平台画的图不计入次数
+    assert plugin.quota.used("user", "aiocqhttp:20002") == 1
+    # 备用平台没有配置好时提醒明天再来
+    config["novelai"]["token"] = ""
+    run(plugin._draw_flow(event, "第四只猫", "", "llm"))
+    assert texts(event)[-1] == "今天画不动啦，明天再来找我吧～"
+    run(plugin.terminate())
+
+
+def test_failed_draws_do_not_use_quota(env):
+    main, config, tmp = env
+    config["quota"]["user_daily_limit"] = 1
+    plugin, ctx = make_plugin(main, config, lambda r: httpx.Response(500, json={"error": "boom"}))
+    event = user_event()
+    run(plugin._draw_flow(event, "画一只猫", "", "llm"))
+    assert plugin.quota.used("user", "aiocqhttp:20002") == 0 and plugin.quota.pending["user"] == {}
+    assert plugin._limit_check(event) == ("", False)
+    run(plugin.terminate())
+
+
+def test_group_limit_with_unique_session_counts_whole_group(env):
+    main, config, tmp = env
+    config["quota"].update(session_daily_limit=1, user_daily_limit=0)
+    plugin, ctx = make_plugin(main, config, nai_ok, quota_responder)
+    a, b = user_event("20002"), user_event("20003")
+    # AstrBot 开启会话隔离后，群里每个成员的 SID 不同
+    a.unified_msg_origin = "aiocqhttp:GroupMessage:20002_30003"
+    b.unified_msg_origin = "aiocqhttp:GroupMessage:20003_30003"
+    run(plugin._draw_flow(a, "画一只猫", "", "llm"))
+    assert plugin._limit_check(b)[0] == "这个群今天的 1 次画画次数已经用完了"
+    config["quota"]["whitelist"] = ["30003"]  # 群号对会话隔离的 SID 也有效
+    assert not plugin._session_blocked(b)
+    run(plugin.terminate())
+
+
+def test_pending_draws_do_not_say_come_back_tomorrow(env):
+    main, config, tmp = env
+    config["quota"].update(session_daily_limit=1, user_daily_limit=0)
+    plugin, ctx = make_plugin(main, config, nai_ok, quota_responder)
+    a, b = user_event("20002"), user_event("20003")
+    session, _ = plugin._quota_keys(a)
+    reservation = plugin.quota.reserve(session, "aiocqhttp:20002")  # a 的图还在画
+    assert plugin._limit_check(b) == ("", True)
+    run(plugin._draw_flow(b, "画一只狗", "", "llm"))
+    assert texts(b) == ["今天的画画次数只剩正在画的这几张了，等它们画完再来试试吧～"]
+    run(plugin.quota.release(reservation, False))  # a 的图失败了，b 还可以画
+    assert plugin._limit_check(b) == ("", False)
+    # 同一个用户的上一张还没画完时，提示稍等，而不是说次数用完
+    plugin._inflight.add("20002")
+    run(plugin._draw_flow(a, "再画一只猫", "", "llm"))
+    assert texts(a) == ["你的上一张画还没完成，请稍等一下～"]
+    run(plugin.terminate())
+
+
+def test_fallback_same_as_main_platform_is_ignored(env):
+    main, config, tmp = env
+    config["quota"].update(session_daily_limit=0, user_daily_limit=1, fallback_backend="novelai")
+    plugin, ctx = make_plugin(main, config, nai_ok, quota_responder)
+    event = user_event()
+    run(plugin._draw_flow(event, "画一只猫", "", "llm"))
+    run(plugin._draw_flow(event, "再画一只猫", "", "llm"))
+    assert texts(event).count("<image>") == 1 and texts(event)[-1] == "今天画不动啦，明天再来找我吧～"
+    run(plugin.terminate())
+
+
+def test_sent_image_counts_even_if_cancelled_during_comment(env):
+    main, config, tmp = env
+    config["quota"].update(session_daily_limit=0, user_daily_limit=3)
+    plugin, ctx = make_plugin(main, config, nai_ok)
+    event = user_event()
+    original = plugin._persona_line
+    commenting = asyncio.Event()
+
+    async def slow_persona_line(ev, persona, kind, **info):
+        if kind == "success":
+            commenting.set()
+            await asyncio.sleep(3600)  # 生成评价时插件被重载
+        return await original(ev, persona, kind, **info)
+
+    plugin._persona_line = slow_persona_line
+
+    async def go():
+        task = asyncio.create_task(plugin._draw_flow(event, "画一只猫", "", "llm"))
+        await commenting.wait()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    run(go())
+    assert "<image>" in texts(event)
+    assert plugin.quota.used("user", "aiocqhttp:20002") == 1 and plugin.quota.pending["user"] == {}
+    run(plugin.terminate())

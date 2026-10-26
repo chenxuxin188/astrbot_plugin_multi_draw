@@ -32,6 +32,8 @@ FALLBACK_LINES = {
     "start": "收到～正在画了，稍等一下哦！",
     "success": "画好啦！看看喜不喜欢～",
     "fail": "呜……这次没能画出来，好失落。",
+    "fallback": "今天的画画次数用完啦，这次换支备用的画笔帮你画，稍等一下哦！",
+    "limit": "今天的画画次数已经用完啦，明天再来找我画吧～",
 }
 
 _THINK_RE = re.compile(r"<(think|thinking)>.*?</\1>", re.S | re.I)
@@ -471,7 +473,8 @@ def build_persona_system_prompt(persona: str, max_len: int) -> str:
     )
 
 
-# 生成人格台词的提示词模板，可在配置中修改。占位符：{description} 绘图需求，{prompt} 英文标签，{error} 失败原因
+# 生成人格台词的提示词模板，可在配置中修改。占位符：{description} 绘图需求，{prompt} 英文标签，{error} 失败原因，
+# {reason} 达到每日次数限制的原因（fallback / limit 使用）
 DEFAULT_PERSONA_PROMPTS = {
     "start": (
         "对方想让你画：{description}\n"
@@ -488,21 +491,34 @@ DEFAULT_PERSONA_PROMPTS = {
         "但是这次画画失败了（原因：{error}）。\n"
         "说一句失落、遗憾的话，不用复述错误细节。"
     ),
+    # 达到每日次数限制、改用备用平台画画时的开画台词
+    "fallback": (
+        "对方想让你画：{description}\n"
+        "但是{reason}，所以这次你换了一支备用的画笔来画，画出来可能和平时不太一样。"
+        "用一句话告诉对方今天的次数用完了、这次用备用画笔来画，并请对方稍等一会儿。"
+    ),
+    # 达到每日次数限制、没有备用平台时的台词（不会画）
+    "limit": (
+        "对方想让你画：{description}\n"
+        "但是{reason}，今天不能再画了。"
+        "用一句话遗憾地告诉对方今天的画画次数已经用完，请对方明天再来找你画。"
+    ),
 }
 
-_PLACEHOLDER_RE = re.compile(r"\{(description|prompt|error)\}")
+_PLACEHOLDER_RE = re.compile(r"\{(description|prompt|error|reason)\}")
 
 # 评价时附上了图片：固定追加在评价提示词后面，让 LLM 依据画面本身评价
 WITH_IMAGE_NOTE = "这幅画已经作为图片附在这条消息里。请仔细看图，评价要和图片里实际画出来的内容相符。"
 
 
 def build_persona_user_prompt(kind: str, template: str = "", *, description: str = "", prompt: str = "",
-                              error: str = "", with_image: bool = False) -> str:
+                              error: str = "", reason: str = "", with_image: bool = False) -> str:
     """用模板生成人格台词的提示词；模板为空时使用默认模板。只替换已知占位符，其余花括号原样保留。"""
     values = {
         "description": description.strip()[:300],
         "prompt": prompt.strip()[:400],
         "error": error.strip()[:200],
+        "reason": reason.strip()[:200],
     }
     template = (template or "").strip() or DEFAULT_PERSONA_PROMPTS[kind]
     text = _PLACEHOLDER_RE.sub(lambda m: values[m.group(1)], template)

@@ -82,6 +82,7 @@ from .prompting import (
     parse_tag_output,
     strip_think,
 )
+from .quota import DailyQuota, Reservation, session_blocked
 from .usage import apply_usage, format_summary, period_start, summarize
 from .webapi import WebApi
 
@@ -104,6 +105,11 @@ USER_IMAGE_TTL = 30 * 60
 USER_IMAGE_ENTRIES = 500
 # 这些平台在流水线结束后会关闭回复通道，后台任务发出的消息会被丢弃，需要等绘图完成
 INLINE_PLATFORMS = ("webchat", "wecom_ai_bot")
+# 每日绘图次数的默认值（配置缺失时使用）
+DEFAULT_DAILY_LIMIT = 5
+# 不在白名单中 / 在黑名单中的会话调用绘图工具时返回给 LLM 的结果
+BLOCKED_TOOL_RESULT = ("这个会话没有开启画画功能，这次没有画。"
+                       "请用你自己的口吻简短地告诉对方这里不能画画，不要再调用绘图工具。")
 # /draw usage 和 draw_usage 默认统计的天数
 DEFAULT_USAGE_DAYS = 30
 USAGE_ALL_WORDS = ("all", "全部", "所有")
@@ -148,6 +154,7 @@ class MultiDrawPlugin(Star):
         self.clients = Clients(http=self.http, novelai=self.nai)
         data_dir = StarTools.get_data_dir(PLUGIN_NAME)
         self.audit = AuditLog(data_dir / "audit.jsonl")
+        self.quota = DailyQuota(data_dir / "quota.json")
         self.gallery = Gallery(data_dir / "images")
         self.eval_dir = data_dir / "eval"
         self.config_lock = asyncio.Lock()
@@ -210,6 +217,62 @@ class MultiDrawPlugin(Star):
         admins = {str(x).strip() for x in raw if str(x).strip()}
         return str(event.get_sender_id()).strip() in admins
 
+    def _session_blocked(self, event: AstrMessageEvent) -> str:
+        """本会话不能画画时返回原因（whitelist / blacklist），否则返回空字符串。"""
+        q = self.section("quota")
+        return session_blocked(event.unified_msg_origin, as_str(event.get_group_id()),
+                               q.get("whitelist"), q.get("blacklist"))
+
+    def _quota_keys(self, event: AstrMessageEvent) -> tuple[str, str]:
+        """每日次数的计数键：(会话, 用户)。
+
+        群聊按群号计数：AstrBot 开启会话隔离（unique_session）后，群里每个成员的 SID 都不同，按 SID 计数会变成按成员计数。
+        """
+        umo = event.unified_msg_origin
+        platform = umo.split(":", 1)[0]
+        group = as_str(event.get_group_id())
+        return (f"{platform}:group:{group}" if group else umo), f"{platform}:{event.get_sender_id()}"
+
+    def _daily_limits(self) -> tuple[int, int]:
+        q = self.section("quota")
+        return (as_int(q.get("session_daily_limit"), DEFAULT_DAILY_LIMIT, 0),
+                as_int(q.get("user_daily_limit"), DEFAULT_DAILY_LIMIT, 0))
+
+    def _limit_check(self, event: AstrMessageEvent) -> tuple[str, bool]:
+        """检查每日绘图次数，返回 (原因, 是否在等正在画的图)。管理员不受限制。
+
+        已经画完的张数达到限制时返回原因（用于人格台词）；只是加上正在画的才达到限制时返回 ("", True)：
+        正在画的图可能失败，这时不能说今天的次数已经用完。
+        """
+        if self._is_admin(event):
+            return "", False
+        session, user = self._quota_keys(event)
+        session_limit, user_limit = self._daily_limits()
+        if session_limit and self.quota.used("session", session, pending=False) >= session_limit:
+            where = "这个群" if as_str(event.get_group_id()) else "这个私聊"
+            return f"{where}今天的 {session_limit} 次画画次数已经用完了", False
+        if user_limit and self.quota.used("user", user, pending=False) >= user_limit:
+            return f"对方今天的 {user_limit} 次画画次数已经用完了", False
+        busy = (session_limit and self.quota.used("session", session) >= session_limit) or \
+            (user_limit and self.quota.used("user", user) >= user_limit)
+        return "", bool(busy)
+
+    def _fallback_backend(self, edit: bool) -> Backend | None:
+        """达到每日次数限制后使用的平台；没有设置或该平台不可用时返回 None。"""
+        key = as_str(self.section("quota").get("fallback_backend"))
+        if key not in BACKENDS:
+            return None
+        normal = self.edit_backend().key if edit else self.backend_key()
+        if key == normal:
+            logger.warning(f"{LOG_PREFIX} 达到每日次数限制后使用的平台与平时{'修改图片' if edit else '绘图'}的平台相同，不改用")
+            return None
+        backend = self.backend(key)
+        reason = backend_missing(backend, edit=edit) or (backend_edit_missing(backend) if edit else "")
+        if reason:
+            logger.warning(f"{LOG_PREFIX} 达到每日次数限制后使用的平台 {backend.label} 不可用：{reason}")
+            return None
+        return backend
+
     # ------------------------------------------------------------------ LLM 工具与指令
 
     @filter.llm_tool(name="draw_image")
@@ -221,6 +284,8 @@ class MultiDrawPlugin(Star):
             description(string): 要画的内容，用自然语言完整描述：角色、外貌、服装、动作、场景、氛围、画风等用户的全部要求，可结合上下文补全
             orientation(string): 可选的画面方向：portrait（竖图）、landscape（横图）或 square（方图），不确定就留空
         """
+        if self._session_blocked(event):
+            return BLOCKED_TOOL_RESULT  # 返回文字让 LLM 自己回复对方
         # 绘图耗时可能超过 AstrBot 的工具调用超时，因此放到后台任务中进行。
         # 返回 None 会结束本轮 Agent 循环，主 LLM 不会再额外回复一条消息。
         task = self._spawn(self._draw_flow(event, str(description or ""), str(orientation or ""), "llm"))
@@ -297,6 +362,8 @@ class MultiDrawPlugin(Star):
             instruction(string): 要怎么修改，用自然语言完整描述用户的要求：改什么、哪些地方保持不变
             orientation(string): 可选，只有用户要求改变画面方向时才填写：portrait（竖图）、landscape（横图）或 square（方图），否则留空以保持原图比例
         """
+        if self._session_blocked(event):
+            return BLOCKED_TOOL_RESULT
         started = time.monotonic()
         # 必须现在就读取图片：AstrBot 4.26-4.28 会在本轮事件结束后删除图片的临时文件，QQ 图片链接也会过期
         prefetched = await self._prefetch_images(event)
@@ -378,6 +445,19 @@ class MultiDrawPlugin(Star):
             missing = backend_missing(self.backend(key))
             mark = "▶" if key == current else ("✅" if not missing else "⚪")
             lines.append(f"{mark} {key}：{BACKENDS[key].label}" + (f"（{missing}）" if missing else ""))
+        blocked = self._session_blocked(event)
+        if blocked:
+            lines.append("本会话：不能画画（" + ("不在白名单中" if blocked == "whitelist" else "在黑名单中") + "）")
+        session, user = self._quota_keys(event)
+        session_limit, user_limit = self._daily_limits()
+        counts = []
+        if session_limit:
+            where = "本群" if as_str(event.get_group_id()) else "本会话"
+            counts.append(f"{where} {self.quota.used('session', session)}/{session_limit}")
+        if user_limit:
+            counts.append(f"你 {self.quota.used('user', user)}/{user_limit}")
+        if counts:
+            lines.append("今日绘图次数：" + "，".join(counts) + ("（管理员不受限制）" if self._is_admin(event) else ""))
         lines.append("管理员可用 /draw use <平台> 切换，例如 /draw use openai")
         yield event.plain_result("\n".join(lines)).use_t2i(False)
 
@@ -556,29 +636,69 @@ class MultiDrawPlugin(Star):
             ask = "想把图片改成什么样呢？把修改要求告诉我吧～" if edit else "想让我画什么呢？把想画的内容告诉我吧～"
             await self._send_text(event, ask)
             return
-        backend = self.edit_backend() if edit else self.backend()
+        uid = str(event.get_sender_id())
+        if uid in self._inflight:
+            await self._send_text(event, "你的上一张画还没完成，请稍等一下～")
+            return
+        limit_reason, busy = self._limit_check(event)
+        if busy:
+            await self._send_text(event, "今天的画画次数只剩正在画的这几张了，等它们画完再来试试吧～")
+            return
+        if limit_reason:
+            backend = self._fallback_backend(edit)
+            if backend is None:
+                logger.info(f"{LOG_PREFIX} {event.unified_msg_origin} 用户 {event.get_sender_id()}："
+                            f"{limit_reason}，不画画")
+                persona = await self._persona_prompt(event)
+                desc = f"修改对方发来的图片：{description}" if edit else description
+                await self._send_text(event, await self._persona_line(event, persona, "limit", description=desc,
+                                                                      reason=limit_reason))
+                return
+            logger.info(f"{LOG_PREFIX} {limit_reason}，改用 {backend.label}")
+            await self._start_draw(event, description, orientation, source, edit, prefetched, backend, limit_reason)
+            return
+        # 先占用次数（检查和占用之间不能有 await），同时发起的请求不会超出限制；图片发出时计入，没有画成功时释放
+        reservation = None if self._is_admin(event) else self.quota.reserve(*self._quota_keys(event))
+        try:
+            await self._start_draw(event, description, orientation, source, edit, prefetched,
+                                   self.edit_backend() if edit else self.backend(), reservation=reservation)
+        finally:
+            if reservation is not None:
+                await self._release_quota(reservation, False)
+
+    async def _release_quota(self, reservation: Reservation, success: bool) -> None:
+        try:
+            await self.quota.release(reservation, success)
+        except Exception as e:
+            logger.warning(f"{LOG_PREFIX} 保存每日绘图次数失败：{_err_text(e)}")
+
+    async def _start_draw(self, event: AstrMessageEvent, description: str, orientation: str, source: str,
+                          edit: bool, prefetched: tuple[list[bytes], int] | None, backend: Backend,
+                          limit_reason: str = "", reservation: Reservation | None = None) -> bool:
+        """检查平台和输入图片后开始画画，返回是否成功发出了图片。"""
         missing = backend_missing(backend, edit=edit)
         if missing:
             await self._send_text(event, f"{missing}，暂时没法画画哦。")
-            return
+            return False
         images: list[InputImage] = []
         if edit:
             reason = backend_edit_missing(backend)
             if reason:
                 await self._send_text(event, f"{reason}，没法修改图片哦。管理员可以在「修改图片使用的平台」中换一个支持的平台。")
-                return
+                return False
             images, seen = await self._edit_inputs(event, backend.max_edit_images, prefetched)
             if not images:
                 await self._send_text(event, "消息里的图片读取失败了（QQ 的图片链接可能已经过期），请重新发送图片再试一次～" if seen
                                       else "没有找到要修改的图片～请把图片和修改要求一起发给我，或者引用那张图片再说要怎么改。")
-                return
+                return False
         uid = str(event.get_sender_id())
         if uid in self._inflight:
             await self._send_text(event, "你的上一张画还没完成，请稍等一下～")
-            return
+            return False
         self._inflight.add(uid)
         try:
-            await self._draw(event, description, orientation, source, backend, images)
+            return await self._draw(event, description, orientation, source, backend, images, limit_reason,
+                                    reservation)
         finally:
             self._inflight.discard(uid)
 
@@ -618,7 +738,12 @@ class MultiDrawPlugin(Star):
             self._last_images.popitem(last=False)
 
     async def _draw(self, event: AstrMessageEvent, description: str, orientation: str, source: str,
-                    backend: Backend, images: list[InputImage] | None = None):
+                    backend: Backend, images: list[InputImage] | None = None, limit_reason: str = "",
+                    reservation: Reservation | None = None) -> bool:
+        """画一张图并发送，返回是否成功。
+
+        limit_reason 不为空表示达到每日次数限制后改用备用平台；reservation 为占用的每日次数，图片发出时计入。
+        """
         images = images or []
         started = time.monotonic()
         record = {
@@ -635,6 +760,8 @@ class MultiDrawPlugin(Star):
         }
         if images:
             record.update(mode="edit", input_images=len(images))
+        if limit_reason:
+            record.update(fallback=True, limit_reason=limit_reason)
         with contextlib.suppress(Exception):
             record["model"] = backend.model  # 生成前就失败（如 LLM 不可用）时记录中也有模型
         # 人格台词中的需求描述：修改图片时说明是在改对方的图
@@ -650,7 +777,11 @@ class MultiDrawPlugin(Star):
                 self._make_prompt(event, description, orientation,
                                   backend.edit_prompt_mode if images else backend.prompt_mode, images)
             ))
-            start_line = await self._persona_line(event, persona, "start", description=persona_desc)
+            if limit_reason:
+                start_line = await self._persona_line(event, persona, "fallback", description=persona_desc,
+                                                      reason=limit_reason)
+            else:
+                start_line = await self._persona_line(event, persona, "start", description=persona_desc)
             queued = self._queued_ahead(backend)
             if queued:
                 start_line += f"\n（前面还有 {queued} 张在排队）"
@@ -669,6 +800,9 @@ class MultiDrawPlugin(Star):
             stage = "send"
             await send_task
             record["status"] = "success"
+            if reservation is not None:
+                # 图片一发出就计入：之后生成评价时插件被重载，也不会漏算
+                await self._release_quota(reservation, True)
         except asyncio.CancelledError:
             record.update(stage=stage, error="任务被取消（插件被停用或重载）")
             if stage != "send":
@@ -696,6 +830,7 @@ class MultiDrawPlugin(Star):
                 prompt_task.cancel()
             record["duration"] = round(time.monotonic() - started, 1)
             await self._save_record(record)
+        return record["status"] == "success"
 
     def _build_request(self, backend: Backend, generated: dict, orientation: str,
                        images: list[InputImage] | None = None) -> DrawRequest:
@@ -973,7 +1108,8 @@ class MultiDrawPlugin(Star):
         pc = self.section("persona")
         max_len = as_int(pc.get("max_length"), 40, 10, 200)
         system_prompt = build_persona_system_prompt(persona, max_len)
-        template = as_str(pc.get(f"{kind}_prompt"))
+        # 达到每日次数限制时的两句台词在「使用范围与每日次数」中设置
+        template = as_str((self.section("quota") if kind in ("fallback", "limit") else pc).get(f"{kind}_prompt"))
         provider_id = as_str(pc.get("provider_id"))
         if image is not None and kind == "success" and as_bool(pc.get("comment_with_image"), False):
             path = None

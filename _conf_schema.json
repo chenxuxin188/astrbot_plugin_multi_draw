@@ -6,7 +6,7 @@
       "type": "string"
     },
     "default": [],
-    "hint": "列表中的用户可以使用 /draw use 切换绘图平台、/draw balance 查询余额、/draw audit 查看绘图记录、/draw usage 查看所有人的消耗统计；其他用户只能查看自己的消耗。"
+    "hint": "列表中的用户可以使用 /draw use 切换绘图平台、/draw balance 查询余额、/draw audit 查看绘图记录、/draw usage 查看所有人的消耗统计；其他用户只能查看自己的消耗。管理员不受每日绘图次数限制。"
   },
   "draw": {
     "description": "通用绘图设置",
@@ -117,6 +117,80 @@
         "type": "int",
         "default": 8,
         "hint": "生成的图片超过该大小时，先转成 JPEG 再发送（保存到图库的仍是原图）。QQ 等平台发送过大的图片容易失败。填 0 表示不压缩。"
+      }
+    }
+  },
+  "quota": {
+    "description": "使用范围与每日次数",
+    "type": "object",
+    "items": {
+      "whitelist": {
+        "description": "白名单 SID",
+        "type": "list",
+        "items": {
+          "type": "string"
+        },
+        "default": [],
+        "hint": "只在这些会话中可以让 Bot 画画和修改图片。留空表示所有会话都可以。群聊直接填群号（AstrBot 开启了会话隔离时，/sid 显示的是单个成员的 SID，只对这个成员有效），私聊填对方的 QQ 号，也可以填 /sid 指令显示的完整 SID（如 aiocqhttp:GroupMessage:123456）。只填数字时，同号的群和私聊都会匹配。不在名单中的会话里，Bot 会告诉对方这里不能画画。"
+      },
+      "blacklist": {
+        "description": "黑名单 SID",
+        "type": "list",
+        "items": {
+          "type": "string"
+        },
+        "default": [],
+        "hint": "这些会话中不能让 Bot 画画和修改图片。仅在白名单为空时生效。填写方式同白名单。"
+      },
+      "session_daily_limit": {
+        "description": "每个会话每天的绘图次数",
+        "type": "int",
+        "default": 5,
+        "hint": "每个群（群里所有人合计；私聊则为每个私聊）每天最多画几张，画图和修改图片都算，只有成功发出的图片才计数。每天 0 点（服务器时间）清零。填 0 表示不限制。管理员不受限制，画的图也不计入。"
+      },
+      "user_daily_limit": {
+        "description": "每个用户每天的绘图次数",
+        "type": "int",
+        "default": 5,
+        "hint": "每个用户每天最多画几张（所有群和私聊合计），计数方式同上。填 0 表示不限制。"
+      },
+      "fallback_backend": {
+        "description": "达到限制后使用的绘图平台",
+        "type": "string",
+        "default": "",
+        "options": [
+          "",
+          "novelai",
+          "openai",
+          "seedream",
+          "xai",
+          "gemini",
+          "sensenova",
+          "comfyui"
+        ],
+        "labels": [
+          "不使用（提醒对方明天再来）",
+          "NovelAI",
+          "OpenAI（GPT Image）",
+          "Seedream（火山方舟 / 豆包）",
+          "xAI（Grok Imagine）",
+          "Gemini（Nano Banana）",
+          "SenseNova（商汤日日新）",
+          "ComfyUI（本地 / 自部署）"
+        ],
+        "hint": "达到每日次数限制后改用这个平台继续画（例如本地 ComfyUI 等免费的平台），改用备用平台画的图不受次数限制。与平时使用的平台相同时不会改用。留空，或该平台没有配置好（修改图片时还需要支持改图）时，Bot 会按人格提醒对方今天的次数已经用完、明天再来。"
+      },
+      "fallback_prompt": {
+        "description": "改用备用平台时的台词提示词",
+        "type": "text",
+        "default": "对方想让你画：{description}\n但是{reason}，所以这次你换了一支备用的画笔来画，画出来可能和平时不太一样。用一句话告诉对方今天的次数用完了、这次用备用画笔来画，并请对方稍等一会儿。",
+        "hint": "达到限制、改用上面的平台画画时，代替「开始画图台词的提示词」发给 LLM 的要求，人格设定会自动附加。可用占位符：{description} 绘图需求，{reason} 达到了哪个限制。留空则使用默认提示词。"
+      },
+      "limit_prompt": {
+        "description": "达到限制、无法画画时的台词提示词",
+        "type": "text",
+        "default": "对方想让你画：{description}\n但是{reason}，今天不能再画了。用一句话遗憾地告诉对方今天的画画次数已经用完，请对方明天再来找你画。",
+        "hint": "达到限制且没有可用的备用平台时，生成提醒台词发给 LLM 的要求，人格设定会自动附加。可用占位符：{description} 绘图需求，{reason} 达到了哪个限制。留空则使用默认提示词。"
       }
     }
   },

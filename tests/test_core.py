@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import audit  # noqa: E402
 import gallery  # noqa: E402
 import prompting  # noqa: E402
+import quota  # noqa: E402
 import usage  # noqa: E402
 from backends import novelai as nai_client  # noqa: E402
 from backends.base import DrawError, DrawRequest  # noqa: E402
@@ -490,8 +491,9 @@ def test_prompt_builders():
     assert "safe for work" not in prompting.build_tag_system_prompt(sfw=False)
     assert "Requested orientation: square" in prompting.build_tag_user_prompt("猫", "square")
     assert "猫娘" in prompting.build_persona_system_prompt("你是猫娘", 30)
-    for kind in ("start", "success", "fail"):
-        text = prompting.build_persona_user_prompt(kind, description="一只猫", prompt="cat", error="boom")
+    for kind in ("start", "success", "fail", "fallback", "limit"):
+        text = prompting.build_persona_user_prompt(kind, description="一只猫", prompt="cat", error="boom",
+                                                   reason="这个群今天的 5 次画画次数已经用完了")
         assert "一只猫" in text and "{" not in text
         assert prompting.FALLBACK_LINES[kind]
     assert "正在画" in prompting.build_persona_user_prompt("start", description="一只猫")
@@ -537,9 +539,10 @@ def test_persona_prompt_with_image():
 
 def test_schema_persona_prompt_defaults_match_code():
     schema = json.loads((Path(__file__).resolve().parent.parent / "_conf_schema.json").read_text(encoding="utf-8"))
-    items = schema["persona"]["items"]
     for kind, template in prompting.DEFAULT_PERSONA_PROMPTS.items():
-        assert items[f"{kind}_prompt"]["default"] == template
+        # 达到每日次数限制时的两句台词在「使用范围与每日次数」中
+        section = "quota" if kind in ("fallback", "limit") else "persona"
+        assert schema[section]["items"][f"{kind}_prompt"]["default"] == template
 
 
 # ---------------------------------------------------------------- audit
@@ -891,3 +894,38 @@ def test_audit_records_and_format_usage(tmp_path):
     assert len(records) == 1 and records[0]["_no"] == 1
     assert "2 张 · 0.14 USD" in audit.format_record(records[0])
 
+
+# ---------------------------------------------------------------- 使用范围与每日次数
+
+
+def test_session_blocked_matching():
+    umo = "aiocqhttp:GroupMessage:123456"
+    assert quota.session_blocked(umo, "123456", [], []) == ""
+    assert quota.session_blocked(umo, "123456", ["123456"], ["123456"]) == ""  # 白名单优先
+    assert quota.session_blocked(umo, "123456", [umo], []) == ""
+    assert quota.session_blocked(umo, "123456", ["999"], []) == "whitelist"
+    assert quota.session_blocked(umo, "123456", [], [" 123456 "]) == "blacklist"
+    assert quota.session_blocked(umo, "123456", "", "111，123456") == "blacklist"  # 字符串也能识别
+    private = "aiocqhttp:FriendMessage:10001"
+    assert quota.session_blocked(private, "", ["10001"], []) == ""
+    assert quota.session_blocked(private, "", None, None) == ""
+
+
+def test_daily_quota_reserve_release_and_rollover(tmp_path, monkeypatch):
+    path = tmp_path / "quota.json"
+    q = quota.DailyQuota(path)
+    monkeypatch.setattr(quota.DailyQuota, "today", staticmethod(lambda: "2026-10-26"))
+    r1 = q.reserve("s", "u")
+    r2 = q.reserve("s", "v")
+    assert q.used("session", "s") == 2 and q.used("user", "u") == 1
+    asyncio.run(q.release(r1, True))
+    asyncio.run(q.release(r1, True))  # 重复释放不会重复计数
+    asyncio.run(q.release(r2, False))
+    assert q.used("session", "s") == 1 and q.used("user", "v") == 0
+    assert json.loads(path.read_text(encoding="utf-8")) == {"date": "2026-10-26", "session": {"s": 1}, "user": {"u": 1}}
+    assert quota.DailyQuota(path).used("session", "s") == 1
+    # 第二天清零；文件中的旧日期也不会被读入
+    monkeypatch.setattr(quota.DailyQuota, "today", staticmethod(lambda: "2026-10-27"))
+    assert q.used("session", "s") == 0 and quota.DailyQuota(path).used("session", "s") == 0
+    path.write_text("not json", encoding="utf-8")
+    assert quota.DailyQuota(path).used("user", "u") == 0
