@@ -1106,3 +1106,76 @@ def test_sent_image_counts_even_if_cancelled_during_comment(env):
     assert "<image>" in texts(event)
     assert plugin.quota.used("user", "aiocqhttp:20002") == 1 and plugin.quota.pending["user"] == {}
     run(plugin.terminate())
+
+
+# ---------------------------------------------------------------- 各聊天平台
+
+
+def test_platforms_that_cannot_send_images_refuse_politely(env):
+    main, config, tmp = env
+    plugin, ctx = make_plugin(main, config, nai_ok)
+
+    def ev(platform, raw=None, **attrs):
+        event = astrbot_stub.AstrMessageEvent(sender="20002", platform=platform)
+        event.message_obj = type("M", (), {"raw_message": raw, "message": []})()
+        for key, value in attrs.items():
+            setattr(event, key, value)
+        return event
+
+    assert run(plugin.draw_image_tool(ev("wecom_ai_bot"), description="猫")) == main.UNSUPPORTED_TOOL_RESULT
+    assert plugin._tool_refusal(ev("wecom_ai_bot", only_use_webhook_url_to_send=True)) is None
+    assert run(plugin.edit_image_tool(ev("weixin_official_account", {"active_send_mode": False}),
+                                      instruction="改成夜景")) == main.UNSUPPORTED_TOOL_RESULT
+    assert plugin._tool_refusal(ev("weixin_official_account", {"active_send_mode": True})) is None
+    assert plugin._tool_refusal(ev("line")) == main.UNSUPPORTED_TOOL_RESULT
+    ctx.config["callback_api_base"] = "https://bot.example.com"
+    assert plugin._tool_refusal(ev("line")) is None
+    for platform in ("aiocqhttp", "telegram", "discord", "lark", "qq_official", "weixin_oc"):
+        assert plugin._tool_refusal(ev(platform)) is None, platform
+    status = run(collect_results(plugin.draw_status(ev("wecom_ai_bot"))))[0][0].text
+    assert "本平台：不能画画（企业微信智能机器人只能回复文字" in status
+    assert not plugin._tasks
+    run(plugin.terminate())
+
+
+def test_file_image_platforms_send_a_temp_file_and_plain_text(env):
+    main, config, tmp = env
+    plugin, ctx = make_plugin(main, config, nai_ok)
+    seen = []
+
+    for platform in ("qq_official", "misskey"):
+        event = astrbot_stub.AstrMessageEvent(sender="10001", platform=platform)
+        original_send = event.send
+
+        async def send(result, original_send=original_send):
+            for comp in result:
+                if isinstance(comp, astrbot_stub.Image):
+                    path = Path(getattr(comp, "path", "") or getattr(comp, "url", ""))
+                    seen.append((platform, comp.file, path, path.is_file()))
+            await original_send(result)
+
+        event.send = send
+        run(plugin._draw_flow(event, "画一只猫", "", "llm"))
+        assert texts(event)[1] == "<image>" or any(s[0] == platform for s in seen)
+        markdown = [r.markdown for r in event.sent if any(isinstance(c, astrbot_stub.Plain) for c in r)]
+        if platform == "qq_official":
+            assert markdown and all(m is False for m in markdown)  # 文字不按 Markdown 发送
+        else:
+            assert all(m is None for m in markdown)
+
+    (qq_platform, qq_file, qq_path, qq_existed), (mk_platform, mk_file, mk_path, mk_existed) = seen
+    assert qq_file.startswith("file:") and qq_path.suffix == ".png" and qq_existed
+    assert mk_file == mk_path.name and mk_file.startswith("multi_draw_") and mk_existed  # 文件名不能是完整路径
+    assert not qq_path.exists() and not mk_path.exists()  # 发送后删除
+    run(plugin.terminate())
+
+
+def test_platform_image_size_cap(env, monkeypatch):
+    main, config, tmp = env
+    config["draw"]["compress_over_mb"] = 0  # 关闭压缩
+    plugin, ctx = make_plugin(main, config, nai_ok)
+    monkeypatch.setattr(main, "to_jpeg", lambda data, edge, quality: b"\xff\xd8small")
+    big = main.DrawResult(image=b"\x89PNG" + b"\x00" * (11 * 1024 * 1024), mime="image/png")
+    assert run(plugin._image_for_sending(big, "telegram")) == b"\xff\xd8small"  # Telegram 最大 10 MB
+    assert run(plugin._image_for_sending(big, "aiocqhttp")) is big.image
+    run(plugin.terminate())

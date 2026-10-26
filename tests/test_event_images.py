@@ -169,3 +169,36 @@ def test_log_never_contains_rkey(caplog):
     with caplog.at_level("WARNING"):
         collect(event, lambda r: httpx.Response(403))
     assert "SECRETKEY" not in caplog.text and "读取本条消息中的图片失败" in caplog.text
+
+
+def test_discord_quoted_image_from_raw_message():
+    class Attachment:
+        def __init__(self, url, content_type="", filename=""):
+            self.url, self.content_type, self.filename = url, content_type, filename
+
+    quoted = type("Q", (), {"attachments": [Attachment("https://cdn.discordapp.com/a/cat.png?ex=1", "image/png"),
+                                            Attachment("https://cdn.discordapp.com/a/notes.txt", "text/plain")]})()
+    fetched = []
+
+    class Channel:
+        async def fetch_message(self, message_id):
+            fetched.append(message_id)
+            return quoted
+
+    def make(resolved):
+        reference = type("R", (), {"resolved": resolved, "message_id": 42})()
+        raw = type("Raw", (), {"reference": reference, "channel": Channel()})()
+        reply = astrbot_stub.Reply([astrbot_stub.Plain("quoted text")])  # AstrBot 只放了文字
+        return event_with([reply], platform="discord", raw=raw)
+
+    def handler(request):
+        assert request.url.host == "cdn.discordapp.com" and request.url.path.endswith("cat.png")
+        return httpx.Response(200, content=PNG)
+
+    assert collect(make(quoted), handler) == ([PNG], 1)
+    assert collect(make(None), handler) == ([PNG], 1) and fetched == [42]  # 没有随事件给出时再取一次
+
+
+def test_describe_hides_telegram_bot_token():
+    text = event_images._describe("https://api.telegram.org/file/bot123456:AAH-secret_token/photos/file_1.jpg")
+    assert "secret" not in text and "/file/bot***/photos/file_1.jpg" in text

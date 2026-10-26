@@ -6,6 +6,7 @@ import time
 import uuid
 from collections import OrderedDict
 from datetime import datetime
+from pathlib import Path
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -34,6 +35,7 @@ from .backends.base import (
     as_float,
     as_int,
     as_str,
+    detect_mime,
     image_orientation,
 )
 from .backends.novelai import (
@@ -105,6 +107,15 @@ USER_IMAGE_TTL = 30 * 60
 USER_IMAGE_ENTRIES = 500
 # 这些平台在流水线结束后会关闭回复通道，后台任务发出的消息会被丢弃，需要等绘图完成
 INLINE_PLATFORMS = ("webchat", "wecom_ai_bot")
+# 这些平台的图片先写成本地文件再发送：QQ 官方机器人的频道只能发送本地文件，KOOK、Misskey 上传时需要正确的文件名
+FILE_IMAGE_PLATFORMS = ("qq_official", "qq_official_webhook", "kook", "misskey")
+# QQ 官方机器人默认把文字按 Markdown 发送，机器人没有 Markdown 权限时会先失败再重试，这里直接发送纯文字
+PLAIN_TEXT_PLATFORMS = ("qq_official", "qq_official_webhook")
+# 平台能接收的图片大小上限（MB），超过时即使关闭了压缩也先转成 JPEG
+PLATFORM_IMAGE_LIMIT_MB = {"telegram": 10, "discord": 10, "lark": 10, "wecom": 10, "weixin_official_account": 10}
+# 当前平台发不出图片时返回给 LLM 的结果
+UNSUPPORTED_TOOL_RESULT = ("这个聊天平台暂时没法发送图片，这次没有画。"
+                           "请用你自己的口吻简短地告诉对方这里没法发图，不要再调用绘图工具。")
 # 每日绘图次数的默认值（配置缺失时使用）
 DEFAULT_DAILY_LIMIT = 5
 # 不在白名单中 / 在黑名单中的会话调用绘图工具时返回给 LLM 的结果
@@ -157,6 +168,7 @@ class MultiDrawPlugin(Star):
         self.quota = DailyQuota(data_dir / "quota.json")
         self.gallery = Gallery(data_dir / "images")
         self.eval_dir = data_dir / "eval"
+        self.outgoing_dir = data_dir / "outgoing"
         self.config_lock = asyncio.Lock()
         self._limiters: dict[str, Limiter] = {}
         # 每个会话最近画好的一张图：用户没有发图时，修改图片默认修改这张
@@ -223,6 +235,34 @@ class MultiDrawPlugin(Star):
         return session_blocked(event.unified_msg_origin, as_str(event.get_group_id()),
                                q.get("whitelist"), q.get("blacklist"))
 
+    def _image_unsupported(self, event: AstrMessageEvent) -> str:
+        """当前平台（按现在的设置）发不出画好的图片时返回原因，否则返回空字符串。"""
+        platform = event.get_platform_name()
+        if platform == "wecom_ai_bot" and not getattr(event, "only_use_webhook_url_to_send", False):
+            return "企业微信智能机器人只能回复文字，开启「仅使用 Webhook 发送消息」后才能发送图片"
+        if platform == "weixin_official_account":
+            raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+            if not (isinstance(raw, dict) and raw.get("active_send_mode")):
+                return "微信公众号在被动回复模式下无法在画好后发送图片，需要在平台设置中开启主动发送模式"
+        if platform == "line":
+            try:
+                base = as_str((self.context.get_config() or {}).get("callback_api_base"))
+            except Exception:
+                base = ""
+            if not base.startswith("https://"):
+                return "LINE 只能发送 HTTPS 链接的图片，需要在 AstrBot 的系统设置中填写 HTTPS 的对外可达地址（callback_api_base）"
+        return ""
+
+    def _tool_refusal(self, event: AstrMessageEvent) -> str | None:
+        """绘图工具不能在本会话使用时返回给 LLM 的结果；可以使用时返回 None。"""
+        if self._session_blocked(event):
+            return BLOCKED_TOOL_RESULT
+        reason = self._image_unsupported(event)
+        if reason:
+            logger.warning(f"{LOG_PREFIX} {reason}，不画画")
+            return UNSUPPORTED_TOOL_RESULT
+        return None
+
     def _quota_keys(self, event: AstrMessageEvent) -> tuple[str, str]:
         """每日次数的计数键：(会话, 用户)。
 
@@ -284,8 +324,9 @@ class MultiDrawPlugin(Star):
             description(string): 要画的内容，用自然语言完整描述：角色、外貌、服装、动作、场景、氛围、画风等用户的全部要求，可结合上下文补全
             orientation(string): 可选的画面方向：portrait（竖图）、landscape（横图）或 square（方图），不确定就留空
         """
-        if self._session_blocked(event):
-            return BLOCKED_TOOL_RESULT  # 返回文字让 LLM 自己回复对方
+        refusal = self._tool_refusal(event)
+        if refusal:
+            return refusal  # 返回文字让 LLM 自己回复对方
         # 绘图耗时可能超过 AstrBot 的工具调用超时，因此放到后台任务中进行。
         # 返回 None 会结束本轮 Agent 循环，主 LLM 不会再额外回复一条消息。
         task = self._spawn(self._draw_flow(event, str(description or ""), str(orientation or ""), "llm"))
@@ -362,10 +403,11 @@ class MultiDrawPlugin(Star):
             instruction(string): 要怎么修改，用自然语言完整描述用户的要求：改什么、哪些地方保持不变
             orientation(string): 可选，只有用户要求改变画面方向时才填写：portrait（竖图）、landscape（横图）或 square（方图），否则留空以保持原图比例
         """
-        if self._session_blocked(event):
-            return BLOCKED_TOOL_RESULT
+        refusal = self._tool_refusal(event)
+        if refusal:
+            return refusal
         started = time.monotonic()
-        # 必须现在就读取图片：AstrBot 4.26-4.28 会在本轮事件结束后删除图片的临时文件，QQ 图片链接也会过期
+        # 必须现在就读取图片：AstrBot 4.26-4.28 会在本轮事件结束后删除图片的临时文件，QQ 等平台的图片链接也会过期
         prefetched = await self._prefetch_images(event)
         task = self._spawn(self._draw_flow(event, str(instruction or ""), str(orientation or ""), "llm",
                                            edit=True, prefetched=prefetched))
@@ -448,6 +490,9 @@ class MultiDrawPlugin(Star):
         blocked = self._session_blocked(event)
         if blocked:
             lines.append("本会话：不能画画（" + ("不在白名单中" if blocked == "whitelist" else "在黑名单中") + "）")
+        unsupported = self._image_unsupported(event)
+        if unsupported:
+            lines.append(f"本平台：不能画画（{unsupported}）")
         session, user = self._quota_keys(event)
         session_limit, user_limit = self._daily_limits()
         counts = []
@@ -688,7 +733,7 @@ class MultiDrawPlugin(Star):
                 return False
             images, seen = await self._edit_inputs(event, backend.max_edit_images, prefetched)
             if not images:
-                await self._send_text(event, "消息里的图片读取失败了（QQ 的图片链接可能已经过期），请重新发送图片再试一次～" if seen
+                await self._send_text(event, "消息里的图片读取失败了（图片链接可能已经过期），请重新发送图片再试一次～" if seen
                                       else "没有找到要修改的图片～请把图片和修改要求一起发给我，或者引用那张图片再说要怎么改。")
                 return False
         uid = str(event.get_sender_id())
@@ -891,8 +936,8 @@ class MultiDrawPlugin(Star):
             if result.text:
                 logger.info(f"{LOG_PREFIX} {backend.label} 返回的文字：{result.text[:500]}")
             # 先把图片发出去，等待扣费结算、保存图片与上传同时进行
-            image = await self._image_for_sending(result)
-            send_task = _quiet(asyncio.create_task(self._deliver(event, event.chain_result([Image.fromBytes(image)]))))
+            image = await self._image_for_sending(result, event.get_platform_name())
+            send_task = _quiet(asyncio.create_task(self._send_image(event, image)))
             try:
                 if before is not None:
                     await self._record_anlas(backend, record, before)
@@ -902,9 +947,12 @@ class MultiDrawPlugin(Star):
                 raise
             return send_task, result
 
-    async def _image_for_sending(self, result: DrawResult) -> bytes:
-        """超过设置大小的图片转成 JPEG 再发送：QQ 等平台以 base64 内联发送图片，过大时可能发送失败。"""
+    async def _image_for_sending(self, result: DrawResult, platform: str = "") -> bytes:
+        """超过设置大小（或平台上限）的图片转成 JPEG 再发送：QQ 等平台以 base64 内联发送图片，过大时可能发送失败。"""
         limit_mb = as_int(self.section("draw").get("compress_over_mb"), 8, 0)
+        cap = PLATFORM_IMAGE_LIMIT_MB.get(platform)
+        if cap and (not limit_mb or limit_mb > cap):
+            limit_mb = cap
         if not limit_mb or len(result.image) <= limit_mb * 1024 * 1024:
             return result.image
         compressed = await asyncio.to_thread(to_jpeg, result.image, 0, 90)
@@ -965,9 +1013,35 @@ class MultiDrawPlugin(Star):
         if not text:
             return
         try:
-            await self._deliver(event, event.plain_result(text))
+            result = event.plain_result(text)
+            if event.get_platform_name() in PLAIN_TEXT_PLATFORMS and callable(getattr(result, "use_markdown", None)):
+                result.use_markdown(False)
+            await self._deliver(event, result)
         except Exception as e:
             logger.warning(f"{LOG_PREFIX} 发送消息失败：{_err_text(e)}")
+
+    async def _send_image(self, event: AstrMessageEvent, data: bytes) -> None:
+        """发送图片。FILE_IMAGE_PLATFORMS 中的平台先写成带扩展名的本地文件，发送后删除。"""
+        platform = event.get_platform_name()
+        if platform not in FILE_IMAGE_PLATFORMS:
+            await self._deliver(event, event.chain_result([Image.fromBytes(data)]))
+            return
+        path = await asyncio.to_thread(self._write_outgoing, data)
+        try:
+            # Misskey 用 file 作为上传的文件名，不能是完整路径；本地路径放在 url 里
+            comp = Image(file=path.name, url=str(path)) if platform == "misskey" else Image.fromFileSystem(str(path))
+            await self._deliver(event, event.chain_result([comp]))
+        finally:
+            with contextlib.suppress(OSError):
+                path.unlink()
+
+    def _write_outgoing(self, data: bytes) -> Path:
+        ext = {"image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif"}.get(detect_mime(data), "png")
+        folder = self.outgoing_dir
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"multi_draw_{uuid.uuid4().hex}.{ext}"
+        path.write_bytes(data)
+        return path.resolve()
 
     # ------------------------------------------------------------------ LLM
 

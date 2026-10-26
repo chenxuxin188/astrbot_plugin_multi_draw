@@ -1,12 +1,12 @@
 {
   "admin_ids": {
-    "description": "管理员 ID 列表（QQ 号）",
+    "description": "管理员 ID 列表",
     "type": "list",
     "items": {
       "type": "string"
     },
     "default": [],
-    "hint": "列表中的用户可以使用 /draw use 切换绘图平台、/draw balance 查询余额、/draw audit 查看绘图记录、/draw usage 查看所有人的消耗统计；其他用户只能查看自己的消耗。管理员不受每日绘图次数限制。"
+    "hint": "填写用户 ID（QQ 号、Telegram 用户 ID 等，可以用 AstrBot 的 /sid 指令查看）。列表中的用户可以使用 /draw use 切换绘图平台、/draw balance 查询余额、/draw audit 查看绘图记录、/draw usage 查看所有人的消耗统计；其他用户只能查看自己的消耗。管理员不受每日绘图次数限制。"
   },
   "draw": {
     "description": "通用绘图设置",
@@ -116,7 +116,7 @@
         "description": "发送前压缩的大小阈值（MB）",
         "type": "int",
         "default": 8,
-        "hint": "生成的图片超过该大小时，先转成 JPEG 再发送（保存到图库的仍是原图）。QQ 等平台发送过大的图片容易失败。填 0 表示不压缩。"
+        "hint": "生成的图片超过该大小时，先转成 JPEG 再发送（保存到图库的仍是原图）。QQ 等平台发送过大的图片容易失败。填 0 表示不压缩（Telegram、Discord、飞书、企业微信、微信公众号超过 10 MB 时仍会压缩）。"
       }
     }
   },
@@ -131,7 +131,7 @@
           "type": "string"
         },
         "default": [],
-        "hint": "只在这些会话中可以让 Bot 画画和修改图片。留空表示所有会话都可以。群聊直接填群号（AstrBot 开启了会话隔离时，/sid 显示的是单个成员的 SID，只对这个成员有效），私聊填对方的 QQ 号，也可以填 /sid 指令显示的完整 SID（如 aiocqhttp:GroupMessage:123456）。只填数字时，同号的群和私聊都会匹配。不在名单中的会话里，Bot 会告诉对方这里不能画画。"
+        "hint": "只在这些会话中可以让 Bot 画画和修改图片。留空表示所有会话都可以。群聊直接填群号（其他平台为群组 / 频道 ID；AstrBot 开启了会话隔离时，/sid 显示的是单个成员的 SID，只对这个成员有效），私聊填对方的用户 ID（如 QQ 号），也可以填 /sid 指令显示的完整 SID（如 aiocqhttp:GroupMessage:123456）。只填数字时，同号的群和私聊都会匹配。不在名单中的会话里，Bot 会告诉对方这里不能画画。"
       },
       "blacklist": {
         "description": "黑名单 SID",

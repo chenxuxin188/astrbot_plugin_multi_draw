@@ -10,6 +10,7 @@ import binascii
 import hashlib
 import html
 import os
+import re
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -52,13 +53,17 @@ def sniff_mime(data: bytes) -> str:
     return ""
 
 
+_BOT_TOKEN_RE = re.compile(r"/bot[^/]+")
+
+
 def _describe(ref: str) -> str:
-    """写日志用：不输出链接参数（QQ 的 rkey 相当于凭证）和 base64 内容。"""
+    """写日志用：不输出链接参数（QQ 的 rkey 相当于凭证）、链接中的机器人 Token 和 base64 内容。"""
     if ref.startswith(("base64://", "data:")):
         return f"<base64，{len(ref)} 字符>"
     if ref.lower().startswith(("http://", "https://")):
         parts = urlsplit(ref)
-        return f"{parts.scheme}://{parts.netloc}{parts.path[:60]}"
+        path = _BOT_TOKEN_RE.sub("/bot***", parts.path)  # Telegram 的文件链接：/file/bot<Token>/...
+        return f"{parts.scheme}://{parts.netloc}{path[:60]}"
     return ref if len(ref) <= 160 else ref[:157] + "..."
 
 
@@ -112,7 +117,7 @@ async def _download(client, url: str) -> bytes:
     url = html.unescape(url) if "&amp;" in url else url  # 部分实现会把 & 转义成 &amp;
     async with client.stream("GET", url, timeout=DOWNLOAD_TIMEOUT) as resp:
         if resp.status_code != 200:
-            raise _FetchError(f"HTTP {resp.status_code}（QQ 图片链接有有效期，过期后需要重新发送图片）")
+            raise _FetchError(f"HTTP {resp.status_code}（图片链接可能已经过期，需要重新发送图片）")
         declared = resp.headers.get("content-length", "")
         if declared.isdigit() and int(declared) > MAX_IMAGE_BYTES:
             raise _FetchError("图片超过 20 MB")
@@ -278,8 +283,31 @@ async def _webchat_quoted(context, reply) -> list[list[str]]:
     return groups
 
 
+async def _discord_quoted(event) -> list[list[str]]:
+    """Discord：AstrBot 只把被引用消息的文字放进 Reply.chain，附件里的图片需要从原始消息中取。"""
+    raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+    ref = getattr(raw, "reference", None)
+    if ref is None:
+        return []
+    message = getattr(ref, "resolved", None)
+    if message is None or not hasattr(message, "attachments"):  # 没有随事件给出，或已被删除
+        channel, message_id = getattr(raw, "channel", None), getattr(ref, "message_id", None)
+        if channel is None or not message_id:
+            return []
+        message = await channel.fetch_message(message_id)
+    groups = []
+    for attachment in getattr(message, "attachments", None) or []:
+        url = str(getattr(attachment, "url", "") or "")
+        content_type = str(getattr(attachment, "content_type", "") or "")
+        if url and (content_type.startswith("image/") or _image_name(getattr(attachment, "filename", "") or url)):
+            groups.append([url])
+    return groups
+
+
 async def _quoted(event, context, reply) -> list[list[str]]:
     platform = event.get_platform_name()
+    if platform == "discord":
+        return await _discord_quoted(event)
     if platform == "aiocqhttp":
         return await _onebot_quoted(event, reply)
     if platform == "webchat":

@@ -27,13 +27,26 @@ class AstrBotConfig(dict):
 
 
 class MessageEventResult(list):
+    markdown = None
+
     def use_t2i(self, flag):
+        return self
+
+    def use_markdown(self, use=True):
+        self.markdown = use
         return self
 
 
 class Image:
-    def __init__(self, file):
+    def __init__(self, file, **kwargs):
         self.file = file
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+    @classmethod
+    def fromFileSystem(cls, path):
+        path = Path(path).resolve()
+        return cls(path.as_uri(), path=str(path))
 
     @classmethod
     def fromBytes(cls, data: bytes):
