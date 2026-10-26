@@ -4,6 +4,22 @@ desc: 让 Bot 借助 LLM 在聊天中画画、改图，支持 NovelAI、OpenAI�
 version: v1.3.1
 author: NyaNyaDance
 repo: https://github.com/chenxuxin188/astrbot_plugin_multi_draw
+tags:
+  - 画图
+  - 生图
+  - 文生图
+  - 图生图
+  - 改图
+  - AI绘画
+  - 图像生成
+  - LLM 工具
+  - NovelAI
+  - OpenAI
+  - Seedream
+  - Gemini
+  - xAI
+  - SenseNova
+  - ComfyUI
 support_platforms:
   - aiocqhttp
   - qq_official
