@@ -9,8 +9,8 @@ from datetime import datetime
 from pathlib import Path
 
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import Image
+from astrbot.api.event import AstrMessageEvent, ResultContentType, filter
+from astrbot.api.message_components import Image, Plain
 from astrbot.api.star import Context, Star, StarTools
 
 from .audit import AuditLog, format_record
@@ -129,6 +129,8 @@ USAGE_TODAY_WORDS = ("today", "今天", "今日")
 DETACHED_KEY = "multi_draw_detached"
 # 提前结束本轮后，至少等这么久再主动发送：WebUI 对话关闭本轮的回复通道需要一点时间，太早发送的消息会丢失
 DETACH_SETTLE_SECONDS = 3.0
+# 每个消息事件单独决定由主模型还是插件负责开工提示，不跨请求、用户或会话共享。
+START_NOTICE_KEY = "multi_draw_start_notice_owner"
 
 
 def _err_text(e: BaseException) -> str:
@@ -315,6 +317,38 @@ class MultiDrawPlugin(Star):
 
     # ------------------------------------------------------------------ LLM 工具与指令
 
+    def _deduplicate_model_text(self, event: AstrMessageEvent, chain) -> None:
+        """主模型先输出时保留它的提示；插件已负责开工时去掉延迟到达的模型文字。"""
+        if chain.type in ("reasoning", "break", "tool_call", "agent_stats", "audio_chunk"):
+            return
+        if not any(isinstance(comp, Plain) and comp.text.strip() for comp in chain.chain):
+            return
+        if event.get_extra(START_NOTICE_KEY) == "plugin":
+            chain.chain = [comp for comp in chain.chain if not isinstance(comp, Plain)]
+        else:
+            event.set_extra(START_NOTICE_KEY, "model")
+
+    @filter.on_decorating_result()
+    async def deduplicate_draw_notice(self, event: AstrMessageEvent):
+        """工具调用的伴随文字不触发 on_llm_response，须在实际发送链路中协调开工提示。"""
+        result = event.get_result()
+        if result is None:
+            return
+        if result.result_content_type == ResultContentType.LLM_RESULT:
+            self._deduplicate_model_text(event, result)
+        elif result.result_content_type == ResultContentType.STREAMING_RESULT and result.async_stream is not None:
+            stream = result.async_stream
+
+            async def deduplicated_stream():
+                try:
+                    async for chain in stream:
+                        self._deduplicate_model_text(event, chain)
+                        yield chain
+                finally:
+                    await stream.aclose()
+
+            result.set_async_stream(deduplicated_stream())
+
     @filter.llm_tool(name="draw_image")
     async def draw_image_tool(self, event: AstrMessageEvent, description: str = "", orientation: str = "",
                               **kwargs):
@@ -328,7 +362,7 @@ class MultiDrawPlugin(Star):
         if refusal:
             return refusal  # 返回文字让 LLM 自己回复对方
         # 绘图耗时可能超过 AstrBot 的工具调用超时，因此放到后台任务中进行。
-        # 返回 None 会结束本轮 Agent 循环，主 LLM 不会再额外回复一条消息。
+        # 返回 None 结束后续 Agent 循环；调用工具前已输出的文字由发送钩子协调，避免重复开工提示。
         task = self._spawn(self._draw_flow(event, str(description or ""), str(orientation or ""), "llm"))
         if task is not None and event.get_platform_name() in INLINE_PLATFORMS:
             # 在工具调用超时之前尽量等绘图完成；等不及时先结束本轮，之后的消息改为主动发送。
@@ -820,17 +854,10 @@ class MultiDrawPlugin(Star):
             persona = await self._persona_prompt(event)
             prompt_task = _quiet(asyncio.create_task(
                 self._make_prompt(event, description, orientation,
-                                  backend.edit_prompt_mode if images else backend.prompt_mode, images)
+                                  backend.edit_prompt_mode if images else backend.prompt_mode, images,
+                                  platform=backend.label)
             ))
-            if limit_reason:
-                start_line = await self._persona_line(event, persona, "fallback", description=persona_desc,
-                                                      reason=limit_reason)
-            else:
-                start_line = await self._persona_line(event, persona, "start", description=persona_desc)
-            queued = self._queued_ahead(backend)
-            if queued:
-                start_line += f"\n（前面还有 {queued} 张在排队）"
-            await self._send_text(event, start_line)
+            await self._send_start_notice(event, backend, persona, persona_desc, limit_reason)
 
             generated = await prompt_task
             req = self._build_request(backend, generated, orientation, images)
@@ -876,6 +903,21 @@ class MultiDrawPlugin(Star):
             record["duration"] = round(time.monotonic() - started, 1)
             await self._save_record(record)
         return record["status"] == "success"
+
+    async def _send_start_notice(self, event: AstrMessageEvent, backend: Backend, persona: str,
+                                 description: str, limit_reason: str) -> None:
+        if event.get_extra(START_NOTICE_KEY) == "model":
+            # 主模型的开工提示已进入发送链路，只补充平台切换、排队等必要信息。
+            line = f"今天的画画次数已用完，这次换用 {backend.label}。" if limit_reason else ""
+        else:
+            # 在调用台词 LLM 前占用提示权，流式/缓冲的主模型文字随后到达时不会再发送。
+            event.set_extra(START_NOTICE_KEY, "plugin")
+            kind = "fallback" if limit_reason else "start"
+            line = await self._persona_line(event, persona, kind, description=description, reason=limit_reason)
+        queued = self._queued_ahead(backend)
+        if queued:
+            line = (line + f"\n（前面还有 {queued} 张在排队）").lstrip()
+        await self._send_text(event, line)
 
     def _build_request(self, backend: Backend, generated: dict, orientation: str,
                        images: list[InputImage] | None = None) -> DrawRequest:
@@ -1120,21 +1162,26 @@ class MultiDrawPlugin(Star):
                                build_edit_user_prompt(description, orientation, len(images), False), PROMPT_LLM_TIMEOUT)
 
     async def _make_prompt(self, event: AstrMessageEvent, description: str, orientation: str, mode: str,
-                           images: list[InputImage] | None = None) -> dict:
+                           images: list[InputImage] | None = None, *, platform: str = "") -> dict:
         """用 LLM 把绘图需求转换成提示词：tags 模式生成英文标签，natural 模式生成自然语言描述；
         修改图片时 natural 模式生成修改指令，tags 模式生成结果图的标签和重绘幅度。"""
         images = images or []
         pc = self.section("prompt")
-        sfw = as_bool(pc.get("sfw_only"), True)
-        extra = as_str(pc.get("extra_instruction"))
+        prompt_options = {
+            "sfw": as_bool(pc.get("sfw_only"), True),
+            "sfw_prompt": as_str(pc.get("sfw_prompt")),
+            "safety_enabled": as_bool(pc.get("safety_enabled"), True),
+            "safety_prompt": as_str(pc.get("safety_prompt")),
+            "extra": as_str(pc.get("extra_instruction")),
+            "platform": platform,
+        }
         provider_id = as_str(pc.get("provider_id"))
         orientation = normalize_orientation(orientation)
         if mode != "tags":
             if images:
-                system_prompt = build_edit_system_prompt(as_str(pc.get("edit_system_prompt")), sfw=sfw, extra=extra)
+                system_prompt = build_edit_system_prompt(as_str(pc.get("edit_system_prompt")), **prompt_options)
             else:
-                system_prompt = build_natural_system_prompt(as_str(pc.get("natural_system_prompt")), sfw=sfw,
-                                                            extra=extra)
+                system_prompt = build_natural_system_prompt(as_str(pc.get("natural_system_prompt")), **prompt_options)
             raw = await self._prompt_llm(event, provider_id, system_prompt, description, orientation, images)
             result = parse_natural_output(raw)
             if not result["prompt"]:
@@ -1143,7 +1190,7 @@ class MultiDrawPlugin(Star):
             return result
 
         build = build_tag_edit_system_prompt if images else build_tag_system_prompt
-        system_prompt = build(as_str(pc.get("tag_system_prompt")), sfw=sfw, extra=extra)
+        system_prompt = build(as_str(pc.get("tag_system_prompt")), **prompt_options)
         raw = await self._prompt_llm(event, provider_id, system_prompt, description, orientation, images)
         strength = parse_strength(raw)
         tags = parse_tag_output(raw)

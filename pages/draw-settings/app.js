@@ -69,6 +69,16 @@ const FOLLOW_SESSION = "（留空：跟随当前会话）";
 const EMPTY_LABELS = { "persona.vision_provider_id": "（留空：同「生成人格台词使用的 LLM」）" };
 // 需要突出显示的开关，以及只在它开启时才生效的字段
 const FEATURED = {
+  "prompt.safety_enabled": {
+    icon: "edit",
+    dependents: ["safety_prompt"],
+    disabledNote: "开启「添加安全规则」后才会使用此项。",
+  },
+  "prompt.sfw_only": {
+    icon: "edit",
+    dependents: ["sfw_prompt"],
+    disabledNote: "开启「仅生成全年龄内容」后才会使用此项。",
+  },
   "persona.comment_with_image": {
     icon: "image",
     dependents: ["vision_provider_id"],

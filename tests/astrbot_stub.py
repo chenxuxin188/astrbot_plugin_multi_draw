@@ -3,6 +3,7 @@
 导入插件包之前调用 install(data_dir)。
 """
 
+import enum
 import json
 import logging
 import sys
@@ -26,8 +27,29 @@ class AstrBotConfig(dict):
             Path(self.config_path).write_text(json.dumps(self, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+class ResultContentType(enum.Enum):
+    LLM_RESULT = enum.auto()
+    GENERAL_RESULT = enum.auto()
+    STREAMING_RESULT = enum.auto()
+
+
 class MessageEventResult(list):
     markdown = None
+    type = None
+    result_content_type = ResultContentType.GENERAL_RESULT
+    async_stream = None
+
+    @property
+    def chain(self):
+        return self
+
+    @chain.setter
+    def chain(self, value):
+        self[:] = value
+
+    def set_async_stream(self, stream):
+        self.async_stream = stream
+        return self
 
     def use_t2i(self, flag):
         return self
@@ -79,6 +101,13 @@ class AstrMessageEvent:
         self.sent: list = []
         self.messages: list = []  # 用户这条消息里的组件（图片修改测试用）
         self._extra = {}
+        self._result = None
+
+    def get_result(self):
+        return self._result
+
+    def set_result(self, result):
+        self._result = result
 
     def get_sender_id(self):
         return self.sender
@@ -137,6 +166,10 @@ class filter:  # noqa: N801
 
     @staticmethod
     def event_message_type(kind, priority=0):
+        return lambda fn: fn
+
+    @staticmethod
+    def on_decorating_result(**kwargs):
         return lambda fn: fn
 
 
@@ -221,6 +254,7 @@ def install(data_dir: Path):
     api.logger = logger
     event = types.ModuleType("astrbot.api.event")
     event.AstrMessageEvent = AstrMessageEvent
+    event.ResultContentType = ResultContentType
     event.filter = filter
     comps = types.ModuleType("astrbot.api.message_components")
     comps.Image = Image

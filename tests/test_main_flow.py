@@ -129,6 +129,227 @@ def test_novelai_flow_text_comment(env):
     assert not any(c.get("image_urls") for c in ctx.calls)
 
 
+@pytest.mark.parametrize("mode,edit", [("tags", False), ("natural", False), ("tags", True), ("natural", True)])
+def test_prompt_settings_used_in_all_modes(env, mode, edit):
+    main, config, _tmp = env
+    config["prompt"].update(safety_enabled=False, safety_prompt="Admin safety rule.",
+                            sfw_only=True, sfw_prompt="Admin all-ages rule.",
+                            tag_system_prompt="Tags for {platform}.",
+                            natural_system_prompt="Description for {platform}.",
+                            edit_system_prompt="Edit for {platform}.")
+    plugin, _ctx = make_plugin(main, config, nai_ok)
+    systems = []
+
+    async def prompt_llm(event, provider_id, system_prompt, description, orientation, images):
+        systems.append(system_prompt)
+        return '{"prompt": "cat", "negative": "", "orientation": "", "strength": 0.4}'
+
+    plugin._prompt_llm = prompt_llm
+
+    async def go():
+        event = astrbot_stub.AstrMessageEvent()
+        images = [main.InputImage(real_png(), "image/png")] if edit else []
+        first = await plugin._make_prompt(event, "画猫", "", mode, images, platform="ComfyUI")
+        config["prompt"].update(safety_enabled=True, sfw_only=False)
+        await plugin._make_prompt(event, "画猫", "", mode, images, platform="Gemini")
+        await plugin.terminate()
+        return first
+
+    result = run(go())
+    assert result["prompt"] == "cat" and result["strength"] == 0.4
+    assert "for ComfyUI." in systems[0] and "{platform}" not in systems[0]
+    assert "Admin all-ages rule." in systems[0] and "Admin safety rule." not in systems[0]
+    assert "for Gemini." in systems[1] and "{platform}" not in systems[1]
+    assert "Admin safety rule." in systems[1] and "Admin all-ages rule." not in systems[1]
+
+
+async def send_model_result(plugin, event, result):
+    result.result_content_type = astrbot_stub.ResultContentType.LLM_RESULT
+    event.set_result(result)
+    await plugin.deduplicate_draw_notice(event)
+    if result.chain:
+        await event.send(result)
+    event.set_result(None)
+
+
+@pytest.mark.parametrize("edit", [False, True])
+@pytest.mark.parametrize("group", ["", "20002"])
+def test_model_acknowledgement_replaces_plugin_start_notice(env, edit, group):
+    main, config, _tmp = env
+    plugin, ctx = make_plugin(main, config, lambda r: httpx.Response(200, content=make_zip(real_png())))
+    event = astrbot_stub.AstrMessageEvent(group=group)
+    if not group:
+        event.unified_msg_origin = f"aiocqhttp:FriendMessage:{event.sender}"
+
+    async def go():
+        await send_model_result(plugin, event, event.plain_result("那咱再画一次喵～"))
+        if edit:
+            plugin._prefetch_images = lambda ev: asyncio.sleep(0, result=([real_png()], 1))
+            await plugin.edit_image_tool(event, "换成海边")
+        else:
+            await plugin.draw_image_tool(event, "画一个猫娘")
+        await asyncio.gather(*list(plugin._tasks))
+        await plugin.terminate()
+
+    run(go())
+    assert texts(event) == ["那咱再画一次喵～", "<image>", "画好啦，满意吗？"]
+    assert not any("开始动笔" in c.get("prompt", "") for c in ctx.calls)
+
+
+@pytest.mark.parametrize("kind", ["empty", "whitespace", "image", "reasoning", "general"])
+def test_non_acknowledgements_do_not_skip_start_notice(env, kind):
+    main, config, _tmp = env
+    plugin, _ctx = make_plugin(main, config, nai_ok)
+    event = astrbot_stub.AstrMessageEvent(group="")
+    result = event.plain_result(" ") if kind == "whitespace" else event.plain_result("思考中")
+    if kind == "empty":
+        result = event.chain_result([])
+    elif kind == "image":
+        result = event.chain_result([astrbot_stub.Image.fromBytes(PNG)])
+    elif kind == "reasoning":
+        result.type = "reasoning"
+    result.result_content_type = (astrbot_stub.ResultContentType.GENERAL_RESULT if kind == "general"
+                                  else astrbot_stub.ResultContentType.LLM_RESULT)
+
+    async def go():
+        event.set_result(result)
+        await plugin.deduplicate_draw_notice(event)
+        event.set_result(None)
+        await plugin._draw_flow(event, "画一个猫娘", "", "llm")
+        await plugin.terminate()
+
+    run(go())
+    assert texts(event) == ["收到，我开始画啦！", "<image>", "画好啦，满意吗？"]
+
+
+def test_streaming_acknowledgement_is_reused_without_changing_chunks(env):
+    main, config, _tmp = env
+    plugin, _ctx = make_plugin(main, config, nai_ok)
+    event = astrbot_stub.AstrMessageEvent(group="")
+    reasoning = event.plain_result("决定调用绘图工具")
+    reasoning.type = "reasoning"
+    ack = event.plain_result("这就画喵～")
+    closed = []
+
+    async def stream():
+        try:
+            yield reasoning
+            yield ack
+            await plugin.draw_image_tool(event, "画一个猫娘")
+            await asyncio.gather(*list(plugin._tasks))
+        finally:
+            closed.append(True)
+
+    async def go():
+        result = event.chain_result([]).set_async_stream(stream())
+        result.result_content_type = astrbot_stub.ResultContentType.STREAMING_RESULT
+        event.set_result(result)
+        await plugin.deduplicate_draw_notice(event)
+        chunks = []
+        async for chunk in result.async_stream:
+            chunks.append(chunk)
+            if chunk.type != "reasoning":
+                await event.send(chunk)
+        await plugin.terminate()
+        return chunks
+
+    chunks = run(go())
+    assert chunks == [reasoning, ack] and closed == [True]
+    assert texts(event) == ["这就画喵～", "<image>", "画好啦，满意吗？"]
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_late_model_text_cannot_duplicate_plugin_start_notice(env, streaming):
+    main, config, _tmp = env
+    plugin, _ctx = make_plugin(main, config, nai_ok)
+    event = astrbot_stub.AstrMessageEvent(group="")
+    image = astrbot_stub.Image.fromBytes(PNG)
+    late = event.chain_result([astrbot_stub.Plain("我开始画啦～"), image])
+
+    async def stream():
+        yield late
+
+    async def go():
+        await plugin._draw_flow(event, "画一个猫娘", "", "llm")
+        if streaming:
+            result = event.chain_result([]).set_async_stream(stream())
+            result.result_content_type = astrbot_stub.ResultContentType.STREAMING_RESULT
+            event.set_result(result)
+            await plugin.deduplicate_draw_notice(event)
+            async for _ in result.async_stream:
+                pass
+        else:
+            late.result_content_type = astrbot_stub.ResultContentType.LLM_RESULT
+            event.set_result(late)
+            await plugin.deduplicate_draw_notice(event)
+        await plugin.terminate()
+
+    run(go())
+    assert list(late) == [image]  # 仅去掉重复文字，保留图片等其它内容
+    assert texts(event) == ["收到，我开始画啦！", "<image>", "画好啦，满意吗？"]
+
+
+def test_notice_owner_is_per_event_and_keeps_queue_and_fallback_details(env):
+    main, config, _tmp = env
+    plugin, _ctx = make_plugin(main, config, nai_ok)
+    first = astrbot_stub.AstrMessageEvent(group="")
+    second = astrbot_stub.AstrMessageEvent(group="")  # 同一用户下一次请求仍须有开工提示
+    plugin._queued_ahead = lambda backend: 2
+
+    async def go():
+        await send_model_result(plugin, first, first.plain_result("这就画喵～"))
+        await plugin._send_start_notice(first, plugin.backend(), "", "画猫", "今天次数用完")
+        await plugin._send_start_notice(second, plugin.backend(), "", "画猫", "")
+        await plugin.terminate()
+
+    run(go())
+    assert texts(first) == ["这就画喵～", "今天的画画次数已用完，这次换用 NovelAI。\n（前面还有 2 张在排队）"]
+    assert texts(second) == ["收到，我开始画啦！\n（前面还有 2 张在排队）"]
+
+
+def test_model_acknowledgement_keeps_generation_failure_messages(env):
+    main, config, _tmp = env
+    plugin, _ctx = make_plugin(main, config, lambda r: httpx.Response(402, json={"message": "Not enough Anlas"}))
+    event = astrbot_stub.AstrMessageEvent(group="")
+
+    async def go():
+        await send_model_result(plugin, event, event.plain_result("这就画喵～"))
+        await plugin.draw_image_tool(event, "画一个猫娘")
+        await asyncio.gather(*list(plugin._tasks))
+        await plugin.terminate()
+
+    run(go())
+    replies = texts(event)
+    assert len(replies) == 3 and replies[0] == "这就画喵～"
+    assert replies[1].startswith("绘图失败：") and replies[2] == "呜呜，失败了……"
+
+
+def test_closing_wrapped_stream_closes_upstream_generator(env):
+    main, config, _tmp = env
+    plugin, _ctx = make_plugin(main, config, nai_ok)
+    event = astrbot_stub.AstrMessageEvent()
+    closed = []
+
+    async def stream():
+        try:
+            yield event.plain_result("开始画图")
+            yield event.plain_result("未消费的文字")
+        finally:
+            closed.append(True)
+
+    async def go():
+        result = event.chain_result([]).set_async_stream(stream())
+        result.result_content_type = astrbot_stub.ResultContentType.STREAMING_RESULT
+        event.set_result(result)
+        await plugin.deduplicate_draw_notice(event)
+        await anext(result.async_stream)
+        await result.async_stream.aclose()
+        await plugin.terminate()
+
+    run(go())
+    assert closed == [True]
+
+
 def test_comment_with_image(env):
     main, config, tmp = env
     config["persona"]["comment_with_image"] = True
@@ -585,6 +806,7 @@ def test_edit_image_from_message_with_separate_edit_backend(env):
     assert rec["input_images"] == 1 and rec["orientation"] == "landscape"  # 保持原图方向
     prompt_calls = [c for c in ctx.calls if "image-editing" in (c.get("system_prompt") or "")]
     assert prompt_calls and prompt_calls[0].get("image_urls")  # 原图一起发给了提示词 LLM
+    assert "for OpenAI." in prompt_calls[0]["system_prompt"]  # 使用改图平台，而非默认的 NovelAI
     start = [c for c in ctx.calls if "开始动笔" in (c.get("prompt") or "")]
     assert start and "修改对方发来的图片" in start[0]["prompt"]
 
@@ -1011,6 +1233,9 @@ def test_daily_limit_with_fallback_backend(env):
         return (await plugin.audit.page(1, 10))[0]
 
     third, second, first = run(go())
+    prompt_calls = [c["system_prompt"] for c in ctx.calls if "Output format (required)" in c.get("system_prompt", "")]
+    assert "for OpenAI text-to-image" in prompt_calls[0]
+    assert all("for NovelAI, using Danbooru" in p for p in prompt_calls[1:])
     assert first["backend"] == "openai" and "fallback" not in first
     assert second["backend"] == third["backend"] == "novelai" and second["fallback"] is True
     assert second["limit_reason"] == "对方今天的 1 次画画次数已经用完了"

@@ -38,9 +38,9 @@ FALLBACK_LINES = {
 
 _THINK_RE = re.compile(r"<(think|thinking)>.*?</\1>", re.S | re.I)
 
-# 把绘图需求转换成 NovelAI 英文 prompt 的系统提示词，可在配置中修改（prompt.tag_system_prompt）
-DEFAULT_TAG_PROMPT = """You are an expert prompt writer for NovelAI Diffusion, an anime-style image model that understands Danbooru tags.
-Your task: turn the user's drawing request (it may be written in Chinese or any other language) into the ENGLISH prompt that will be sent directly to NovelAI for image generation. NovelAI only understands English, so translate every detail of the request into English tags.
+# 把绘图需求转换成英文标签的系统提示词，可在配置中修改（prompt.tag_system_prompt）
+DEFAULT_TAG_PROMPT = """You are an expert prompt writer for {platform}, using Danbooru-style English tags.
+Your task: turn the user's drawing request (it may be written in Chinese or any other language) into the ENGLISH prompt that will be sent directly to {platform} for image generation. Translate every detail of the request into English tags.
 
 Rules for "prompt":
 - Lowercase, comma-separated Danbooru-style English tags; short English phrases are allowed only for things tags cannot express.
@@ -53,13 +53,16 @@ Rules for "negative": only extra things to avoid that are specific to this reque
 
 Rules for "orientation": portrait for single characters / full body; landscape for scenery, wide scenes or several characters side by side; square for icons, avatars or close-up faces."""
 
-# 固定附加在系统提示词后、不可配置的部分：解析依赖输出格式，英文要求与安全规则不能被改掉
+# 固定附加在系统提示词后、不可配置的部分：解析依赖输出格式与英文要求
 TAG_OUTPUT_RULES = """Output format (required):
 Output ONLY one JSON object, without markdown code fences or any other text:
 {"prompt": "<English tags>", "negative": "<English tags or empty string>", "orientation": "portrait|landscape|square"}
-"prompt" and "negative" are the English prompt and English negative prompt sent to NovelAI. ENGLISH ONLY: they must not contain any Chinese, Japanese, Korean or other non-English text.
+"prompt" and "negative" are the English prompt and English negative prompt sent to the image model. ENGLISH ONLY: they must not contain any Chinese, Japanese, Korean or other non-English text."""
 
-Safety (always applies): never sexualize characters who are or look like minors (e.g. petite, child-like or loli characters). Depict them only in clearly non-sexual, non-suggestive ways, whatever the request says."""
+DEFAULT_SAFETY_PROMPT = (
+    "Never sexualize characters who are or look like minors (e.g. petite, child-like or loli characters). "
+    "Depict them only in clearly non-sexual, non-suggestive ways, whatever the request says."
+)
 
 TAG_SFW_RULE = (
     "Keep the image safe for work: no nudity or sexual content. "
@@ -67,7 +70,7 @@ TAG_SFW_RULE = (
 )
 
 # 自然语言模式（OpenAI / Gemini / Seedream / xAI / SenseNova 等）的系统提示词，可在配置中修改（prompt.natural_system_prompt）
-DEFAULT_NATURAL_PROMPT = """You are an expert prompt writer for modern text-to-image models such as GPT Image, Gemini, Seedream, Grok Imagine and FLUX.
+DEFAULT_NATURAL_PROMPT = """You are an expert prompt writer for {platform} text-to-image generation.
 Your task: turn the user's drawing request (it may be written in Chinese or any other language) into ONE detailed English image description that will be sent directly to the image model.
 
 Rules for "prompt":
@@ -81,13 +84,11 @@ Rules for "negative": a short English list of things to avoid that are specific 
 
 Rules for "orientation": portrait for single characters / full body; landscape for scenery, wide scenes or several characters side by side; square for icons, avatars or close-up faces."""
 
-# 自然语言模式固定附加的部分：解析依赖输出格式，安全规则不能被改掉
+# 自然语言模式固定附加的部分：解析依赖输出格式
 NATURAL_OUTPUT_RULES = """Output format (required):
 Output ONLY one JSON object, without markdown code fences or any other text:
 {"prompt": "<English description>", "negative": "<things to avoid, or empty string>", "orientation": "portrait|landscape|square"}
-Write "prompt" and "negative" in English; only text that must appear inside the image may keep its original language.
-
-Safety (always applies): never sexualize characters who are or look like minors (e.g. petite, child-like or loli characters). Depict them only in clearly non-sexual, non-suggestive ways, whatever the request says."""
+Write "prompt" and "negative" in English; only text that must appear inside the image may keep its original language."""
 
 MAX_NATURAL_PROMPT_CHARS = 3000
 
@@ -208,28 +209,37 @@ def clean_tags(text: object, limit: int = MAX_PROMPT_CHARS) -> str:
     return ", ".join(out)
 
 
-def build_tag_system_prompt(base: str = "", *, sfw: bool = True, extra: str = "") -> str:
-    """系统提示词 = 可配置部分（为空时用默认值）+ 固定的输出格式、英文与安全要求 + 可选规则。"""
-    prompt = (base or "").strip() or DEFAULT_TAG_PROMPT
-    prompt += "\n\n" + TAG_OUTPUT_RULES
+def _build_system_prompt(base: str, default: str, output_rules: str, *, sfw: bool, extra: str,
+                         safety_enabled: bool, safety_prompt: str, sfw_prompt: str, platform: str) -> str:
+    """只替换 {platform}，保留 JSON、权重语法和其它花括号；安全规则与全年龄规则独立开关。"""
+    prompt = ((base or "").strip() or default).replace("{platform}", platform.strip() or "image model")
+    prompt += "\n\n" + output_rules
+    if safety_enabled:
+        prompt += "\n\nSafety rules:\n" + ((safety_prompt or "").strip() or DEFAULT_SAFETY_PROMPT)
     if sfw:
-        prompt += "\n\nSafety: " + TAG_SFW_RULE
+        prompt += "\n\nSafety: " + ((sfw_prompt or "").strip() or TAG_SFW_RULE)
     extra = (extra or "").strip()
     if extra:
         prompt += "\n\nAdditional requirements from the bot admin:\n" + extra
     return prompt
 
 
-def build_natural_system_prompt(base: str = "", *, sfw: bool = True, extra: str = "") -> str:
-    """自然语言模式的系统提示词 = 可配置部分（为空时用默认值）+ 固定的输出格式与安全要求 + 可选规则。"""
-    prompt = (base or "").strip() or DEFAULT_NATURAL_PROMPT
-    prompt += "\n\n" + NATURAL_OUTPUT_RULES
-    if sfw:
-        prompt += "\n\nSafety: " + TAG_SFW_RULE
-    extra = (extra or "").strip()
-    if extra:
-        prompt += "\n\nAdditional requirements from the bot admin:\n" + extra
-    return prompt
+def build_tag_system_prompt(base: str = "", *, sfw: bool = True, extra: str = "",
+                            safety_enabled: bool = True, safety_prompt: str = "", sfw_prompt: str = "",
+                            platform: str = "NovelAI") -> str:
+    """标签模式：可配置提示词 + 固定输出格式 + 可选的安全、全年龄与额外要求。"""
+    return _build_system_prompt(base, DEFAULT_TAG_PROMPT, TAG_OUTPUT_RULES, sfw=sfw, extra=extra,
+                                safety_enabled=safety_enabled, safety_prompt=safety_prompt,
+                                sfw_prompt=sfw_prompt, platform=platform)
+
+
+def build_natural_system_prompt(base: str = "", *, sfw: bool = True, extra: str = "",
+                                safety_enabled: bool = True, safety_prompt: str = "", sfw_prompt: str = "",
+                                platform: str = "") -> str:
+    """自然语言模式：可配置提示词 + 固定输出格式 + 可选规则。"""
+    return _build_system_prompt(base, DEFAULT_NATURAL_PROMPT, NATURAL_OUTPUT_RULES, sfw=sfw, extra=extra,
+                                safety_enabled=safety_enabled, safety_prompt=safety_prompt,
+                                sfw_prompt=sfw_prompt, platform=platform)
 
 
 def clean_description(text: object, limit: int = MAX_NATURAL_PROMPT_CHARS) -> str:
@@ -348,7 +358,7 @@ def build_tag_user_prompt(description: str, orientation: str = "") -> str:
 # ---------------------------------------------------------------- 图片修改
 
 # 自然语言模式修改图片的系统提示词，可在配置中修改（prompt.edit_system_prompt）
-DEFAULT_EDIT_PROMPT = """You are an expert at writing instructions for AI image-editing models such as GPT Image, Gemini, Seedream and Grok Imagine.
+DEFAULT_EDIT_PROMPT = """You are an expert at writing image-editing instructions for {platform}.
 Your task: turn the user's editing request (it may be written in Chinese or any other language) into ONE clear English editing instruction. It will be sent to the image model together with the user's image(s). If the images are attached to this message, look at them first.
 
 Rules for "prompt":
@@ -365,9 +375,7 @@ Rules for "orientation": leave it empty to keep the original image's aspect rati
 EDIT_OUTPUT_RULES = """Output format (required):
 Output ONLY one JSON object, without markdown code fences or any other text:
 {"prompt": "<English editing instruction>", "negative": "<things to avoid, or empty string>", "orientation": "", "strength": <number>}
-Write "prompt" and "negative" in English; only text that must appear inside the image may keep its original language. "orientation" may be empty. "strength" is optional.
-
-Safety (always applies): never sexualize characters who are or look like minors (e.g. petite, child-like or loli characters). Depict them only in clearly non-sexual, non-suggestive ways, whatever the request says."""
+Write "prompt" and "negative" in English; only text that must appear inside the image may keep its original language. "orientation" may be empty. "strength" is optional."""
 
 # 标签模式（NovelAI / ComfyUI 图生图）修改图片时固定追加在标签系统提示词后面
 TAG_EDIT_RULES = """IMAGE EDITING (img2img): the image will be regenerated from the user's original image with img2img, guided by your tags.
@@ -376,38 +384,32 @@ TAG_EDIT_RULES = """IMAGE EDITING (img2img): the image will be regenerated from 
 - Leave "orientation" empty to keep the original image's aspect ratio unless the user asks to change it."""
 
 
-def build_edit_system_prompt(base: str = "", *, sfw: bool = True, extra: str = "") -> str:
-    """自然语言模式修改图片的系统提示词 = 可配置部分（为空时用默认值）+ 固定的输出格式与安全要求 + 可选规则。"""
-    prompt = (base or "").strip() or DEFAULT_EDIT_PROMPT
-    prompt += "\n\n" + EDIT_OUTPUT_RULES
-    if sfw:
-        prompt += "\n\nSafety: " + TAG_SFW_RULE
-    extra = (extra or "").strip()
-    if extra:
-        prompt += "\n\nAdditional requirements from the bot admin:\n" + extra
-    return prompt
+def build_edit_system_prompt(base: str = "", *, sfw: bool = True, extra: str = "",
+                             safety_enabled: bool = True, safety_prompt: str = "", sfw_prompt: str = "",
+                             platform: str = "") -> str:
+    """自然语言模式修改图片：可配置提示词 + 固定输出格式 + 可选规则。"""
+    return _build_system_prompt(base, DEFAULT_EDIT_PROMPT, EDIT_OUTPUT_RULES, sfw=sfw, extra=extra,
+                                safety_enabled=safety_enabled, safety_prompt=safety_prompt,
+                                sfw_prompt=sfw_prompt, platform=platform)
 
 
 TAG_EDIT_OUTPUT_RULES = """Output format (required):
 Output ONLY one JSON object, without markdown code fences or any other text:
 {"prompt": "<English tags>", "negative": "<English tags or empty string>", "orientation": "", "strength": <number>}
-"prompt" and "negative" are the English prompt and English negative prompt sent to the image model. ENGLISH ONLY: they must not contain any Chinese, Japanese or Korean or other non-English text. "orientation" must stay empty unless the user asks to change the image's orientation.
-
-Safety (always applies): never sexualize characters who are or look like minors (e.g. petite, child-like or loli characters). Depict them only in clearly non-sexual, non-suggestive ways, whatever the request says."""
+"prompt" and "negative" are the English prompt and English negative prompt sent to the image model. ENGLISH ONLY: they must not contain any Chinese, Japanese or Korean or other non-English text. "orientation" must stay empty unless the user asks to change the image's orientation."""
 
 # 默认标签提示词中按内容选择画面方向的规则：修改图片时要保持原图方向，不能使用
 _TAG_ORIENTATION_RULE_RE = re.compile(r'\n*Rules for "orientation":[^\n]*')
 
 
-def build_tag_edit_system_prompt(base: str = "", *, sfw: bool = True, extra: str = "") -> str:
+def build_tag_edit_system_prompt(base: str = "", *, sfw: bool = True, extra: str = "",
+                                 safety_enabled: bool = True, safety_prompt: str = "", sfw_prompt: str = "",
+                                 platform: str = "NovelAI") -> str:
     """标签模式修改图片：标签系统提示词（去掉选择画面方向的规则）+ 修改图片的输出格式 + 图生图规则。"""
     prompt = _TAG_ORIENTATION_RULE_RE.sub("", (base or "").strip() or DEFAULT_TAG_PROMPT)
-    prompt += "\n\n" + TAG_EDIT_OUTPUT_RULES
-    if sfw:
-        prompt += "\n\nSafety: " + TAG_SFW_RULE
-    extra = (extra or "").strip()
-    if extra:
-        prompt += "\n\nAdditional requirements from the bot admin:\n" + extra
+    prompt = _build_system_prompt(prompt, "", TAG_EDIT_OUTPUT_RULES, sfw=sfw, extra=extra,
+                                  safety_enabled=safety_enabled, safety_prompt=safety_prompt,
+                                  sfw_prompt=sfw_prompt, platform=platform)
     return prompt + "\n\n" + TAG_EDIT_RULES
 
 
@@ -438,7 +440,7 @@ def build_tag_retry_prompt(description: str, orientation: str, previous: str) ->
     """上一次输出含非英文内容时，要求 LLM 全部改写成英文。"""
     return (
         build_tag_user_prompt(description, orientation)
-        + "\n\nYour previous answer contained Chinese, Japanese or Korean text, which NovelAI cannot understand:\n"
+        + "\n\nYour previous answer contained Chinese, Japanese or Korean text, which the image model cannot understand:\n"
         + previous.strip()[:1500]
         + "\n\nAnswer again with the same JSON format. Translate everything into English tags; "
         "do not output a single Chinese, Japanese or Korean character."

@@ -440,13 +440,57 @@ def test_choose_tag_result():
 def test_tag_system_prompt_is_configurable():
     custom = prompting.build_tag_system_prompt("自定义：只画风景。", sfw=False)
     assert custom.startswith("自定义：只画风景。")
-    # 输出格式、英文要求和安全规则始终附加
+    # 输出格式与英文要求固定附加；安全规则默认开启
     assert prompting.TAG_OUTPUT_RULES in custom and "ENGLISH ONLY" in custom and "minors" in custom
     default = prompting.build_tag_system_prompt("   ")
-    assert default.startswith(prompting.DEFAULT_TAG_PROMPT)
-    assert "english prompt that will be sent directly to novelai" in prompting.DEFAULT_TAG_PROMPT.lower()
+    assert default.startswith(prompting.DEFAULT_TAG_PROMPT.replace("{platform}", "NovelAI"))
     schema = json.loads((Path(__file__).resolve().parent.parent / "_conf_schema.json").read_text(encoding="utf-8"))
     assert schema["prompt"]["items"]["tag_system_prompt"]["default"] == prompting.DEFAULT_TAG_PROMPT
+
+
+@pytest.mark.parametrize("builder,output_rules", [
+    (prompting.build_tag_system_prompt, prompting.TAG_OUTPUT_RULES),
+    (prompting.build_natural_system_prompt, prompting.NATURAL_OUTPUT_RULES),
+    (prompting.build_edit_system_prompt, prompting.EDIT_OUTPUT_RULES),
+    (prompting.build_tag_edit_system_prompt, prompting.TAG_EDIT_OUTPUT_RULES),
+])
+@pytest.mark.parametrize("safety,sfw", [(True, True), (True, False), (False, True), (False, False)])
+def test_configurable_prompt_rules_and_platform(builder, output_rules, safety, sfw):
+    base = 'For {platform} and {platform}: {unknown}, {{weighted tags}}, {"example": "value"}'
+    result = builder(base, platform="ComfyUI", safety_enabled=safety, safety_prompt="Custom safety rule.",
+                     sfw=sfw, sfw_prompt="Custom all-ages rule.", extra="Use watercolor.")
+    assert result.startswith(base.replace("{platform}", "ComfyUI"))
+    assert output_rules in result
+    assert ("Custom safety rule." in result) is safety
+    assert ("Custom all-ages rule." in result) is sfw
+    assert prompting.DEFAULT_SAFETY_PROMPT not in result and prompting.TAG_SFW_RULE not in result
+    assert "Use watercolor." in result
+    if builder is prompting.build_tag_edit_system_prompt:
+        assert prompting.TAG_EDIT_RULES in result
+
+
+@pytest.mark.parametrize("builder", [prompting.build_tag_system_prompt, prompting.build_natural_system_prompt,
+                                     prompting.build_edit_system_prompt, prompting.build_tag_edit_system_prompt])
+def test_prompt_rule_defaults_and_empty_config(builder):
+    result = builder("  ", safety_prompt="  ", sfw_prompt="  ", platform="Seedream")
+    assert "Seedream" in result and "{platform}" not in result
+    assert prompting.DEFAULT_SAFETY_PROMPT in result and prompting.TAG_SFW_RULE in result
+    disabled = builder(safety_enabled=False, sfw=False)
+    assert prompting.DEFAULT_SAFETY_PROMPT not in disabled and prompting.TAG_SFW_RULE not in disabled
+
+
+def test_schema_prompt_defaults_match_code():
+    schema = json.loads((Path(__file__).resolve().parent.parent / "_conf_schema.json").read_text(encoding="utf-8"))
+    fields = schema["prompt"]["items"]
+    for key, default in {
+        "tag_system_prompt": prompting.DEFAULT_TAG_PROMPT,
+        "natural_system_prompt": prompting.DEFAULT_NATURAL_PROMPT,
+        "edit_system_prompt": prompting.DEFAULT_EDIT_PROMPT,
+        "safety_prompt": prompting.DEFAULT_SAFETY_PROMPT,
+        "sfw_prompt": prompting.TAG_SFW_RULE,
+    }.items():
+        assert fields[key]["default"] == default
+    assert fields["safety_enabled"]["default"] is True and fields["sfw_only"]["default"] is True
 
 
 def test_parse_tag_output_normalizes_fullwidth():
