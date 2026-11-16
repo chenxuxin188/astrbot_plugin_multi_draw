@@ -114,6 +114,9 @@ INPUT_MAX_PIXELS = 36_000_000
 # data URL 中的图片格式必须小写
 _DATA_URL_FORMAT = {"image/png": "png", "image/jpeg": "jpeg", "image/webp": "webp", "image/gif": "gif",
                     "image/bmp": "bmp", "image/tiff": "tiff", "image/heic": "heic", "image/heif": "heif"}
+# extra_body 中的 image 只用于画图（例如固定角色外貌的参考图）；修改图片时 image 由插件填写，忽略配置中的值，
+# 否则用户要修改的图片会被替换掉
+_EDIT_RESERVED = ("image",)
 # 不能修改图片的模型（只认没有选择模型系列时的模型 ID）
 _NO_EDIT_MODELS = (
     (re.compile(r"seededit"), "SeedEdit 3.0 已于 2026-03-31 下线，请改用 doubao-seedream-5-0-pro-260628 等 Seedream 模型"),
@@ -646,7 +649,8 @@ class SeedreamBackend(Backend):
             body["background"] = "transparent"
             body["output_format"] = "png"
         extra = self.section.get("extra_body")
-        body.update(extra if isinstance(extra, dict) else parse_extra_json(as_str(extra), self.label))
+        extra = extra if isinstance(extra, dict) else parse_extra_json(as_str(extra), self.label)
+        body.update({k: v for k, v in extra.items() if k not in _EDIT_RESERVED})
         return body
 
     def plan(self, req: DrawRequest) -> dict:

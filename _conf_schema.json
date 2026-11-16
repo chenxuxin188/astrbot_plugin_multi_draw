@@ -706,7 +706,7 @@
         "editor_mode": true,
         "editor_language": "json",
         "default": "",
-        "hint": "JSON 对象，最后合并进请求体（画图和修改图片都会使用），可以覆盖插件生成的字段（不做校验，填错模型不支持的值会导致请求失败），例如 {\"optimize_prompt_options\": {\"mode\": \"fast\"}}（仅 5.0 pro / 4.0）。留空表示不添加。"
+        "hint": "JSON 对象，最后合并进请求体（画图和修改图片都会使用），可以覆盖插件生成的字段（不做校验，填错模型不支持的值会导致请求失败），例如 {\"optimize_prompt_options\": {\"mode\": \"fast\"}}（仅 5.0 pro / 4.0）。填 {\"image\": \"https://…/角色.png\"}（公网可访问的图片地址，或 data:image/png;base64,… ）可以让每次画图都参考这张图，保持角色外貌一致、画风仍按提示词（4.0 及以上的模型支持）；修改图片时其中的 image 会被忽略，仍使用用户发送的图片。留空表示不添加。"
       },
       "access_key_id": {
         "description": "Access Key ID（仅用于查询余额）",

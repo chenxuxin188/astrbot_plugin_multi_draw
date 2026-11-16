@@ -1034,6 +1034,29 @@ def test_edit_byteplus_and_extra_body():
     assert body["image"] == data_url(JPEG, "jpeg")
 
 
+@pytest.mark.parametrize("ref", ["https://example.com/char.png", data_url(PNG, "png")])
+def test_extra_body_image_is_reference_for_drawing_only(ref):
+    """extra_body 中的 image（角色参考图）随画图请求发送；修改图片时忽略，仍使用用户发送的图片。"""
+    section = {"api_key": KEY, "extra_body": json.dumps({"image": ref, "watermark": True})}
+    _, calls = run(section, lambda r: ok())
+    body = body_of(calls[0])
+    assert body["image"] == ref and body["watermark"] is True
+    assert body["size"] == DEFAULT_SIZES["portrait"]  # 画图的尺寸，不按参考图计算
+
+    _, calls = run(section, lambda r: ok(), edit_req())
+    body = body_of(calls[0])
+    assert body["image"] == data_url(JPEG, "jpeg") and body["watermark"] is True  # 其他字段照常合并
+    assert_valid_edit(body, "5.0-pro")
+
+
+def test_edit_extra_body_image_ignored_with_dict_config_untouched():
+    extra = {"image": "https://example.com/char.png", "watermark": True}
+    section = {"api_key": KEY, "extra_body": extra}
+    _, calls = run(section, lambda r: ok(), edit_req(image(), image()))
+    assert body_of(calls[0])["image"] == [data_url(JPEG, "jpeg")] * 2
+    assert section["extra_body"] == {"image": "https://example.com/char.png", "watermark": True}
+
+
 def test_edit_key_echoed_by_relay_is_masked():
     secret = "sk-relay-secret-123456789"
     error, _ = run({"api_key": secret, "base_url": "https://relay.example.com/v1"}, lambda r: httpx.Response(
