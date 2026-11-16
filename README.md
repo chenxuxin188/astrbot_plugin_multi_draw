@@ -216,11 +216,26 @@ AstrBot ≥ 4.24.2 中，在 WebUI 的插件页面点开本插件，进入「绘
 ## 开发
 
 ```bash
-python -m pip install httpx pytest pillow
+python -m pip install httpx pytest pillow ruff
 python -m pytest tests
+ruff check .
 ```
+
+- 推送到 main 和每个 PR 都会由 GitHub Actions 运行上面的检查（Python 3.10 / 3.12 / 3.14），并检查 `metadata.yaml` 的版本号在 `CHANGELOG.md` 中有对应的条目。
 
 - `backends/`、`prompting.py`、`audit.py`、`gallery.py`、`settings.py`、`imaging.py` 不依赖 AstrBot，可以单独测试。
 - `tests/test_main_flow.py` 用 `tests/astrbot_stub.py` 模拟 AstrBot，端到端测试 `main.py` 和页面接口。
 - 所有测试的 HTTP 请求都由 `httpx.MockTransport` 模拟，不会访问网络。
 - 「绘图设置」页面在 `pages/draw-settings/`，是不需要构建的原生 JavaScript；表单根据 `_conf_schema.json` 自动生成。
+
+### 发布新版本
+
+1. 把 `CHANGELOG.md` 中的「## 未发布」改成 `## v1.2.3（YYYY-MM-DD）`，把 `metadata.yaml` 的 `version` 改成 `v1.2.3`，通过 PR 合并到 main。
+2. 在 main 上打标签并推送：
+   ```bash
+   git tag v1.2.3
+   git push origin v1.2.3
+   ```
+3. GitHub Actions 会重新运行检查，确认标签与 `metadata.yaml` 的版本号一致、标签指向 main 上的提交，然后用 `CHANGELOG.md` 中该版本的内容创建 GitHub Release。
+
+较早的 AstrBot 安装、更新插件时会下载最新的 Release，新版本 AstrBot 直接下载默认分支，因此合并到 main 的改动应尽快发布，保持两者一致。
