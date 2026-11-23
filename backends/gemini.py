@@ -417,6 +417,8 @@ class GeminiBackend(Backend):
     max_edit_images = MAX_EDIT_IMAGES
     # 没有重绘幅度 / 遮罩字段（imageConfig.strength 等返回 400 Unknown name），修改靠文字指令
     supports_strength = False
+    # 角色参考图与修改图片一样用 inlineData 传递，但只属于文生图
+    supports_references = True
     supports_balance = False
     billing_url = BILLING_URL
 
@@ -604,12 +606,12 @@ class GeminiBackend(Backend):
             raise
 
     async def _call(self, clients: Clients, api: str, prompt: str, ratio: str, tier: str, seed: int | None,
-                    extra: dict, images: list[tuple[str, str]] | tuple = ()) -> tuple[bytes, str, dict]:
+                    extra: dict, images: list[tuple[str, str]] | tuple = (), *, edit: bool = False) -> tuple[bytes, str, dict]:
         url, body = self.build_request(api, prompt, ratio, tier, seed, images)
         data = await self._request(clients, "POST", url, timeout=self.timeout, json=merge_extra(body, extra))
         usage = gemini_usage(data)
         if api != "interactions":
-            b64, text = parse_generate_content(data, edit=bool(images))
+            b64, text = parse_generate_content(data, edit=edit)
             return decode_image(b64), text, usage
         block, text = parse_interaction(data)
         if block.get("data"):
@@ -626,7 +628,9 @@ class GeminiBackend(Backend):
             raise DrawError(self.missing())
         ratio, tier = self.image_config(req.orientation)
         images: list[tuple[str, str]] = []
+        references: list[tuple[str, str]] = []
         dropped = 0
+        ref_dropped = 0
         if req.is_edit:
             reason = self.edit_missing()
             if reason:
@@ -635,13 +639,20 @@ class GeminiBackend(Backend):
             dropped = max(0, len(req.images) - limit)
             images = encode_inputs(req.images[:limit], self.label)  # 先校验，格式或大小不对时不发请求
             ratio = self.edit_ratio(req, ratio)
+        elif req.references:
+            # 角色参考图：只附加图片，不进入修改图片的尺寸推断与参数记录
+            limit = self.edit_limit
+            ref_dropped = max(0, len(req.references) - limit)
+            references = encode_inputs(req.references[:limit], self.label)
+        request_images = images if req.is_edit else references
         seed = as_int(req.seed, 0)
         seed = seed % 2**31 if seed else None  # seed 是 int32
         prompt = final_prompt(req, self.supports_negative)
         extra = self.extra_body()  # 先解析，JSON 有误时不发请求
         api = "interactions" if self.api == "interactions" else "generate_content"
         try:
-            image, text, usage = await self._call(clients, api, prompt, ratio, tier, seed, extra, images)
+            image, text, usage = await self._call(clients, api, prompt, ratio, tier, seed, extra, request_images,
+                                                  edit=req.is_edit)
         except DrawError as e:
             # 自动模式：generateContent 不提供该模型（404，不计费）时改用 Interactions API 再试一次。
             # 额外请求参数按 generateContent 的格式填写，回退时不附加。
@@ -649,7 +660,8 @@ class GeminiBackend(Backend):
                 raise
             api = "interactions"
             try:
-                image, text, usage = await self._call(clients, api, prompt, ratio, tier, seed, {}, images)
+                image, text, usage = await self._call(clients, api, prompt, ratio, tier, seed, {}, request_images,
+                                                      edit=req.is_edit)
             except DrawError as e2:
                 if e2.status == 404:  # 两个接口都找不到，多半是模型名或 API 地址有误，报告第一个错误
                     raise e from e2
@@ -660,6 +672,10 @@ class GeminiBackend(Backend):
             params.update(mode="edit", input_images=len(images))
             if dropped:  # 超出当前模型的输入图片数，只使用了前几张
                 params["input_images_dropped"] = dropped
+        if references:
+            params["references"] = len(references)
+            if ref_dropped:
+                params["references_dropped"] = ref_dropped
         if tier:
             params["image_size"] = tier
         if self.thinking_level:

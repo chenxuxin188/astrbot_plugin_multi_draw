@@ -475,6 +475,8 @@ class SeedreamBackend(Backend):
     max_edit_images = MAX_EDIT_IMAGES
     # 没有重绘幅度参数，按修改指令修改图片
     supports_strength = False
+    # 文生图支持角色参考图（image 字段，与修改图片共用一个字段但互不同时使用）
+    supports_references = True
     # 需要单独配置 IAM Access Key（方舟 API Key 不能查询余额）
     supports_balance = True
     billing_url = BILLING["volcengine"]["console"]
@@ -564,6 +566,18 @@ class SeedreamBackend(Backend):
             body["optimize_prompt_options"] = {"mode": "fast"}
         extra = self.section.get("extra_body")
         body.update(extra if isinstance(extra, dict) else parse_extra_json(as_str(extra), self.label))
+        if req.references and not req.is_edit:
+            # 角色参考图走文生图的 image 字段；命中 references 时以它为准，
+            # 否则 extra_body 里配置的固定 image 会覆盖按角色命中的参考图
+            limit = self.max_edit_images
+            if len(req.references) > limit:
+                raise DrawError(f"{self.label} {FAMILY_NAMES[self.family]} 文生图最多使用 {limit} 张参考图，"
+                                f"本次命中 {len(req.references)} 张")
+            urls = []
+            for index, image in enumerate(req.references, 1):
+                check_input_size(image, self.label, index)
+                urls.append(image_data_url(image, self.label, index))
+            body["image"] = urls[0] if len(urls) == 1 else urls
         return body
 
     async def generate(self, clients: Clients, req: DrawRequest) -> DrawResult:
@@ -704,6 +718,8 @@ class SeedreamBackend(Backend):
             params["output_format"] = as_str(item.get("output_format")) or body["output_format"]
         if isinstance(body.get("optimize_prompt_options"), dict):
             params["optimize_mode"] = body["optimize_prompt_options"].get("mode")
+        if req.references and not req.is_edit:
+            params["references"] = len(req.references)
         if req.is_edit:
             params["mode"] = "edit"
             params["input_images"] = len(req.images)

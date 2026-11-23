@@ -129,6 +129,35 @@ def test_novelai_flow_text_comment(env):
     assert not any(c.get("image_urls") for c in ctx.calls)
 
 
+def test_attach_references_supported_unsupported_and_edit_bypass(env):
+    main, config, tmp = env
+    source = tmp / "reference.png"
+    source.write_bytes(real_png())
+    config["references"] = json.dumps([{"keywords": ["cat"], "images": [str(source)]}])
+    plugin, _ctx = make_plugin(main, config, nai_ok)
+    supported_req = main.DrawRequest("a cat")
+    unsupported_req = main.DrawRequest("a cat")
+    edit_req = main.DrawRequest("change it", images=[main.InputImage(real_png(), "image/png")])
+    supported_record, unsupported_record, edit_record = {}, {}, {}
+
+    async def go():
+        try:
+            await plugin._attach_references(plugin.backend("novelai"), supported_req, supported_record)
+            # 不支持的平台不应尝试读取命中的本地文件
+            config["references"] = json.dumps([{"keywords": ["cat"], "images": [str(tmp / "missing.png")]}])
+            await plugin._attach_references(plugin.backend("openai"), unsupported_req, unsupported_record)
+            # 修改图片完全绕过 references，连无效 JSON 也不会影响原有 edit 流程
+            config["references"] = "not json"
+            await plugin._attach_references(plugin.backend("novelai"), edit_req, edit_record)
+        finally:
+            await plugin.terminate()
+
+    run(go())
+    assert len(supported_req.references) == 1 and supported_record == {"references": 1}
+    assert unsupported_req.references == [] and unsupported_record == {"references_ignored": 1}
+    assert edit_req.references == [] and edit_record == {}
+
+
 @pytest.mark.parametrize("mode,edit", [("tags", False), ("natural", False), ("tags", True), ("natural", True)])
 def test_prompt_settings_used_in_all_modes(env, mode, edit):
     main, config, _tmp = env

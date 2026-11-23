@@ -55,6 +55,9 @@ class DrawRequest:
     seed: int = 0  # 0 表示随机（后端不支持种子时忽略）
     # 图片修改：非空时按这些图片和提示词生成修改后的图片
     images: list[InputImage] = field(default_factory=list)
+    # 角色参考图：只用于文生图（固定角色外貌等），由插件按提示词关键词命中后填入。
+    # 与 images 是两条独立通道：不影响 is_edit，也不会进入修改图片的流程
+    references: list[InputImage] = field(default_factory=list)
     # 重绘幅度（0-1，NovelAI / ComfyUI 等图生图后端使用），0 表示使用后端配置的默认值
     strength: float = 0.0
 
@@ -534,6 +537,8 @@ class Backend:
     max_edit_images: int = 0
     # 图片修改使用重绘幅度（req.strength，图生图）而不是修改指令
     supports_strength: ClassVar[bool] = False
+    # 是否支持角色参考图（req.references，文生图时传入，例如固定角色外貌）
+    supports_references: ClassVar[bool] = False
     supports_balance: ClassVar[bool] = False
     # 同时进行的请求数上限；None 表示使用插件的全局设置
     max_concurrency: ClassVar[int | None] = None
