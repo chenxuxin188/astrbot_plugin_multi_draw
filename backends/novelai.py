@@ -99,6 +99,8 @@ class ImageRequest:
     noise: float = EDIT_DEFAULT_NOISE
     # 用户提供的图片数；NovelAI 只使用第一张，其余的忽略
     input_images: int = 0
+    # 角色参考图（Vibe Transfer，V4 及以上）：与图生图底图无关，发送前转成 PNG 的 base64
+    references: list[bytes] = field(default_factory=list, repr=False)
 
 
 def edit_size(src_width: int, src_height: int, budget_pixels: int) -> tuple[int, int]:
@@ -226,6 +228,32 @@ def random_seed() -> int:
     return random.randint(1, MAX_SEED)
 
 
+def supports_vibe_transfer(model: str) -> bool:
+    """Vibe Transfer（reference_image_multiple）只有 V4 及以上模型支持。"""
+    return str(model).startswith(("nai-diffusion-4", "nai-diffusion-5"))
+
+
+# Vibe Transfer 的参考强度：与官方网页端的默认值一致
+REFERENCE_STRENGTH = 0.6
+
+
+def reference_png(data: bytes) -> bytes:
+    """Vibe Transfer 的参考图需要 PNG；已经是 PNG 时原样返回，其余格式用 Pillow 转换。"""
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return data
+    try:
+        from PIL import Image
+    except ImportError as e:
+        raise NovelAIError("NovelAI 的角色参考图需要转成 PNG，请先安装 Pillow") from e
+    try:
+        with Image.open(io.BytesIO(data)) as im:
+            buf = io.BytesIO()
+            im.save(buf, "PNG")
+            return buf.getvalue()
+    except Exception as e:
+        raise NovelAIError(f"无法读取角色参考图（{type(e).__name__}）") from e
+
+
 def build_payload(req: ImageRequest) -> dict:
     """构造 /ai/generate-image 的请求体（V3 / V4 / V4.5 通用格式）。"""
     seed = req.seed if 0 < req.seed <= MAX_SEED else random_seed()
@@ -268,6 +296,12 @@ def build_payload(req: ImageRequest) -> dict:
         "reference_information_extracted_multiple": [],
         "reference_strength_multiple": [],
     }
+    if req.references:
+        # 角色参考图走 Vibe Transfer，与图生图的 parameters.image 是两套独立参数
+        encoded = [base64.b64encode(item).decode("ascii") for item in req.references]
+        params["reference_image_multiple"] = encoded
+        params["reference_information_extracted_multiple"] = [1.0] * len(encoded)
+        params["reference_strength_multiple"] = [REFERENCE_STRENGTH] * len(encoded)
     if req.sampler == "k_euler_ancestral":
         params["deliberate_euler_ancestral_bug"] = False
         params["prefer_brownian"] = True
@@ -577,6 +611,8 @@ class NovelAIBackend(Backend):
     # 图生图只接受一张底图（parameters.image 是单个字符串）；除局部重绘专用模型外所有模型都支持
     max_edit_images = 1
     supports_strength = True
+    # 角色参考图使用 Vibe Transfer；V3 等不支持的模型会在参数记录中标记 references_ignored
+    supports_references = True
     # 余额（订阅、Anlas、V5 用量条）用同一个 Persistent API Token 查询 /user/subscription
     supports_balance = True
     billing_url = "https://novelai.net/image"
@@ -661,6 +697,9 @@ class NovelAIBackend(Backend):
             # 原图在 generate() 中再缩放成 width × height 的 PNG，plan() 不做图片处理
             edit = dict(image=source.data, strength=clamp_strength(req.strength), noise=self.edit_noise,
                         input_images=len(req.images))
+        references = []
+        if req.references and not req.is_edit and supports_vibe_transfer(self.model):
+            references = [image.data for image in req.references]
         return ImageRequest(
             model=self.model,
             prompt=req.prompt,
@@ -673,6 +712,7 @@ class NovelAIBackend(Backend):
             sampler=as_str(self.section.get("sampler")) or "k_euler_ancestral",
             noise_schedule=as_str(self.section.get("noise_schedule")) or "karras",
             seed=req.seed if 0 < req.seed <= MAX_SEED else random_seed(),
+            references=references,
             **edit,
         )
 
@@ -694,6 +734,8 @@ class NovelAIBackend(Backend):
             "seed": image_req.seed,
             "opus_free": is_opus_free(image_req.model, image_req.width, image_req.height, image_req.steps),
         }
+        if image_req.references:
+            params["references"] = len(image_req.references)
         if image_req.image is not None:
             # 官方订阅说明：有底图的生成不在 Opus 免费范围内；官方网页端的计价却不排除底图。
             # 两者冲突，这里保守地记为"可能消耗 Anlas"，实际是否扣费以前后余额差（anlas_cost）为准
@@ -704,7 +746,10 @@ class NovelAIBackend(Backend):
         return params
 
     def plan(self, req: DrawRequest) -> dict:
-        return self._params(self._image_request(req))
+        params = self._params(self._image_request(req))
+        if req.references and not req.is_edit and not supports_vibe_transfer(self.model):
+            params["references_ignored"] = len(req.references)
+        return params
 
     @staticmethod
     def _client(clients: Clients) -> "NovelAIClient":
@@ -725,6 +770,11 @@ class NovelAIBackend(Backend):
                 is_v5_model(image_req.model),
             )
             send_req = dataclasses.replace(image_req, image=png)
+        if image_req.references:
+            references = await asyncio.to_thread(
+                lambda: [reference_png(data) for data in image_req.references]
+            )
+            send_req = dataclasses.replace(send_req, references=references)
         try:
             image = await self._client(clients).generate(
                 send_req, token=self.token, base_url=self.base_url, proxy=self.proxy, timeout=self.timeout
@@ -734,7 +784,10 @@ class NovelAIBackend(Backend):
                 raise NovelAIError(f"{e}。修改图片（图生图）可能不在 Opus 免费出图范围内，需要消耗 Anlas",
                                    status=e.status) from e
             raise
-        return image_result(image, self._params(image_req))
+        params = self._params(image_req)
+        if req.references and not req.is_edit and not supports_vibe_transfer(self.model):
+            params["references_ignored"] = len(req.references)
+        return image_result(image, params)
 
     async def subscription(self, clients: Clients) -> dict:
         return await self._client(clients).subscription(token=self.token, base_url=self.base_url, proxy=self.proxy)

@@ -8,6 +8,12 @@
     "default": [],
     "hint": "填写用户 ID（QQ 号、Telegram 用户 ID 等，可以用 AstrBot 的 /sid 指令查看）。列表中的用户可以使用 /draw use 切换绘图平台、/draw balance 查询余额、/draw audit 查看绘图记录、/draw usage 查看所有人的消耗统计；其他用户只能查看自己的消耗。管理员不受每日绘图次数限制。"
   },
+  "references": {
+    "description": "角色参考图（JSON）",
+    "type": "text",
+    "default": "",
+    "hint": "按提示词关键词为文生图附加角色参考图，不影响修改图片。填写 JSON 数组，例如：[{\"name\":\"小汐\",\"keywords\":[\"xiaoxi-whale-girl\"],\"images\":[\"D:/img/xiaoxi.jpg\"]}]。keywords 和 images 可写单个字符串或数组；images 支持本地路径、data: URL、HTTP(S) URL。可同时配置多个角色和多张图片，命中多组时按配置顺序合并并按来源去重。目前支持 Seedream、Gemini 和 NovelAI V4/V5（Vibe Transfer），其他平台或模型会忽略并在日志、绘图记录中注明。"
+  },
   "draw": {
     "description": "通用绘图设置",
     "type": "object",

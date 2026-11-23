@@ -52,6 +52,11 @@ from .backends.novelai import (
 from .backends.novelai import (
     balance_info as novelai_balance_info,
 )
+from .references import (
+    load_images as load_reference_images,
+    match_sources as match_reference_sources,
+    parse_groups as parse_reference_groups,
+)
 from .event_images import (
     ImageCollector,
     collect_event_images,
@@ -865,6 +870,7 @@ class MultiDrawPlugin(Star):
             if req.negative:
                 logger.info(f"{LOG_PREFIX} 发送给 {backend.label} 的负面 prompt：{req.negative}")
             record.update(prompt=req.prompt, negative=req.negative, orientation=req.orientation)
+            await self._attach_references(backend, req, record)
 
             stage = "generate"
             send_task, result = await self._generate(backend, req, record, event)
@@ -918,6 +924,34 @@ class MultiDrawPlugin(Star):
         if queued:
             line = (line + f"\n（前面还有 {queued} 张在排队）").lstrip()
         await self._send_text(event, line)
+
+    async def _attach_references(self, backend: Backend, req: DrawRequest, record: dict) -> None:
+        """按 prompt 关键词加载角色参考图；只用于文生图，不支持的平台显式记录后忽略。"""
+        if req.is_edit:
+            return
+        groups = parse_reference_groups(self.config.get("references"))
+        sources = match_reference_sources(groups, req.prompt)
+        if not sources:
+            return
+        if not backend.supports_references:
+            record["references_ignored"] = len(sources)
+            logger.warning(
+                f"{LOG_PREFIX} {backend.label} 不支持角色参考图，已忽略命中的 {len(sources)} 张图片"
+            )
+            return
+        images, skipped = await load_reference_images(
+            self.clients, sources, proxy=backend.proxy, timeout=backend.timeout
+        )
+        for reason in skipped:
+            logger.warning(f"{LOG_PREFIX} 跳过角色参考图 {reason}")
+        if skipped:
+            record["references_skipped"] = len(skipped)
+        if not images:
+            logger.warning(f"{LOG_PREFIX} 命中的角色参考图均不可用，按无参考图继续生成")
+            return
+        req.references = images
+        record["references"] = len(images)
+        logger.info(f"{LOG_PREFIX} 为 {backend.label} 附加了 {len(images)} 张角色参考图")
 
     def _build_request(self, backend: Backend, generated: dict, orientation: str,
                        images: list[InputImage] | None = None) -> DrawRequest:
